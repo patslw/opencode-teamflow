@@ -1,0 +1,28 @@
+{
+  "name": "opencode-teamflow",
+  "version": "0.1.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "plugin",
+    "apps/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit && npm run typecheck --workspace=@teamflow/web",
+    "build": "tsc && npm run build --workspace=@teamflow/web",
+    "demo:web": "node dist/apps/web-host/src/main.js",
+    "demo:tui": "node scripts/demo-tui.mjs",
+    "demo:prepare": "node scripts/prepare-demo.mjs",
+    "demo:example": "node scripts/first-review.mjs"
+  },
+  "dependencies": {
+    "@opencode/client": "2.3.0",
+    "@opencode/plugin": "2.3.0",
+    "zod": "4.6.6"
+  },
+  "devDependencies": {
+    "@types/node": "26.0.0",
+    "typescript": "6.0.2"
+  }
+}

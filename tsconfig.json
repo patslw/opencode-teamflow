@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist",
+    "rootDir": ".",
+    "types": ["node"],
+    "jsx": "preserve"
+  },
+  "include": ["packages/**/*.ts", "plugin/**/*.ts", "plugin/**/*.tsx", "apps/web-host/**/*.ts"]
+}

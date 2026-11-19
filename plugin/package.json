@@ -1,0 +1,1 @@
+{"name":"opencode-teamflow-plugin","version":"0.0.1","private":true,"type":"module","exports":{".":"./src/index.ts","./rpc":"./src/rpc.ts","./tui":"./src/tui.tsx"}}

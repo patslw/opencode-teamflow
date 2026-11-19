@@ -1,0 +1,9 @@
+{
+  "selectedBackend": "local",
+  "backends": {
+    "local": {
+      "endpoint": "http://127.0.0.1:49374",
+      "projects": [".runtime/demo-project"]
+    }
+  }
+}

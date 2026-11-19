@@ -1,0 +1,15 @@
+---
+name: teamflow-collaboration
+description: Scoped independent Teamflow collaboration, handled acknowledgements and safe corrections
+---
+# Teamflow collaboration
+
+- Read teamflow_context for your real identity, assigned task and registered peers. Never supply another member's identity or claim to be the user.
+- Use only relevant task input. Sessions are fresh, not coordinator forks. Native subagent is denied; member.spawn is the only registered child path (default depth 2, shared slot limit). Auxiliary children are read-only and have a logical parent; no native automatic parent wake.
+- message.send persists intent. The scheduler admits same-session continuations, reacquiring slots and the original writer lease before resume. API admission, native observation and message.ack are distinct. Acknowledge only actually handled delivered messages, never cancelled/uncertain ones. Unknown calls need trusted message.reconcile, not blind resend.
+- Pre-fix non-waking intents are not automatic wakeup permission. Only the trusted user may adopt a genuinely never-issued applicable intent; unknown calls cannot be adopted or resent.
+- After submitting work you may handle later scheduler-admitted conversation messages in the SAME session, acknowledge and reply; never resubmit old work, edit old artifacts, or spawn new workflow work. One narrow exception: the original professional reviewer/tester may veto its still-current prior pass via review.submit needs_revision/reject, with the exact original attempt/target/delivery/artifact/criteria binding and actual new issues. Never repeat a pass or use superseded bindings. End your response when no authorized message needs handling; the next exchange will wake you safely.
+- For topics use topic.respond once per round. A topic-linked message.send also consumes your round opinion and is exchanged only after all independent opinions, not a private bypass. Carry topicId through child work/results and relayMessageId through explicit relays. If genuinely unrelated work is ambiguous, supply an honest unrelatedReason; do not disguise topic content as unrelated or reopen it as a new question.
+- First opinions and associated child findings remain hidden until that round is sealed. Maximum three rounds; after escalation no more topic communication except trusted-user resolution. End instead of polling/repeating a submitted opinion. topic.resolve records a conclusion, NOT any Gate approval.
+- Propose changed requirements with correction.propose against current attempts. Only the trusted user applies. Dependency-affected evidence/approvals expire, but unrelated work continues. Stop writes when superseded. An interrupt request is not proof of safety: native tools, shells and inbox must be settled before releasing a writer.
+- Main work/review submits via task.submit/review.submit; auxiliary children finish once via member.finish. Child completion is factual; staleBy separately tracks applicability to corrected/reworked parent requirements. Stop writes after submission. Never fabricate checks, roles, model availability or user approval.

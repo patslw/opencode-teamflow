@@ -1,0 +1,1784 @@
+import React, { useEffect, useRef, useState } from "react";
+import { createRoot } from "react-dom/client";
+import {
+  ReactFlow,
+  Background,
+  Controls,
+  MiniMap,
+  MarkerType,
+} from "@xyflow/react";
+import type { Connection } from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
+import "./style.css";
+import { CollaborationPanel } from "./CollaborationPanel";
+import { DraftView } from "./DraftView";
+import { PatchView } from "./PatchView";
+import { BackendChooser } from "./BackendChooser";
+import {
+  connectBackend,
+  MutationRejectedError,
+  type TeamflowConnection,
+} from "./connection";
+import type {
+  BackendScope,
+  TeamflowSnapshot,
+  TeamflowCommand,
+  MutationResult,
+  MutationEnvelope,
+  WorkflowVersion,
+  WorkflowNode,
+  WorkflowRole,
+  StageAttempt,
+  Member,
+  Task,
+} from "../../../packages/protocol/src/index";
+import {
+  VersionSchema,
+  TemplateSchema,
+} from "../../../packages/protocol/src/index";
+
+const statusNames: Record<string, string> = {
+  running: "运行中",
+  waiting: "等待你确认 / 检查",
+  paused: "已暂停",
+  completed: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+  pending: "待前置完成",
+  ready: "就绪",
+  awaiting_gate: "等待批准",
+  passed: "已通过",
+  needs_revision: "需要返工",
+  superseded: "已失效",
+  uncertain: "派工不确定",
+  bound: "已绑定",
+  submitted: "已提交",
+  intent: "派工意图",
+};
+const label = (status: string) => statusNames[status] ?? status;
+const lines = (value: string) =>
+  value
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean);
+const pretty = (value: unknown) => JSON.stringify(value, null, 2);
+const currentAttempt = (s: TeamflowSnapshot, runId: string, nodeId: string) =>
+  s.attempts
+    .filter((a) => a.runId === runId && a.nodeId === nodeId)
+    .sort((a, b) => b.round - a.round)[0];
+function Json({ value }: { value: unknown }) {
+  return <pre>{pretty(value)}</pre>;
+}
+function Field({
+  title,
+  value,
+  onChange,
+  multiline = false,
+  disabled = false,
+}: {
+  title: string;
+  value: string;
+  onChange?: (v: string) => void;
+  multiline?: boolean;
+  disabled?: boolean;
+}) {
+  // Keep raw newlines while typing array-backed fields (their protocol value is normalized).
+  const [raw, setRaw] = useState(value);
+  const focused = useRef(false);
+  useEffect(() => {
+    if (!focused.current) setRaw(value);
+  }, [value]);
+  const props = {
+    value: onChange ? raw : value,
+    readOnly: !onChange,
+    disabled,
+    onFocus: () => {
+      focused.current = true;
+    },
+    onBlur: () => {
+      focused.current = false;
+      setRaw(value);
+    },
+    onChange: (
+      e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>,
+    ) => {
+      setRaw(e.target.value);
+      onChange?.(e.target.value);
+    },
+  };
+  return (
+    <label className="field">
+      <span>{title}</span>
+      {multiline ? <textarea {...props} /> : <input {...props} />}
+    </label>
+  );
+}
+type Mutate = (command: TeamflowCommand) => Promise<MutationResult | undefined>;
+function useEditorState<T>(initial: T, epoch: React.RefObject<number>) {
+  const [value, setValue] = useState(initial);
+  const update: React.Dispatch<React.SetStateAction<T>> = (next) => {
+    epoch.current++;
+    setValue(next);
+  };
+  return [value, update] as const;
+}
+
+function App({ selectedScope, active }: { selectedScope: BackendScope; active: boolean }) {
+  const editorEpoch = useRef(0);
+  const [snapshot, setSnapshot] = useState<TeamflowSnapshot>();
+  const [scope, setScope] = useState<BackendScope>();
+  const [connectionState, setConnectionState] = useState("正在连接");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [pending, setPending] = useState(false);
+  const [unresolved, setUnresolved] = useState<MutationEnvelope>();
+  const [versionId, setVersionId] = useEditorState("", editorEpoch);
+  const [runId, setRunId] = useEditorState("", editorEpoch);
+  const [nodeId, setNodeId] = useEditorState("", editorEpoch);
+  const [memberId, setMemberId] = useEditorState("", editorEpoch);
+  const [draft, setDraft] = useEditorState<WorkflowVersion | undefined>(
+    undefined,
+    editorEpoch,
+  );
+  const [draftPanelInput, setDraftPanelInput] = useState(false);
+  const [draftPanelText, setDraftPanelText] = useEditorState("", editorEpoch);
+  const [runLabel, setRunLabel] = useEditorState("", editorEpoch);
+  const [brief, setBrief] = useEditorState("", editorEpoch);
+  const [slots, setSlots] = useEditorState(4, editorEpoch),
+    [depth, setDepth] = useEditorState(2, editorEpoch),
+    [reworks, setReworks] = useEditorState(3, editorEpoch);
+  const [edgeKind, setEdgeKind] = useState<"normal" | "return">("normal");
+  const [selectedEdge, setSelectedEdge] = useState<number>();
+  const [importText, setImportText] = useEditorState("", editorEpoch);
+  const mutationLock = useRef(false);
+  useEffect(() => {
+    if (!draft && !draftPanelText) return;
+    const warn = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [draft, draftPanelText]);
+  const connection = useRef<TeamflowConnection | undefined>(undefined);
+  const generation = useRef(0);
+  const [reconnect, setReconnect] = useState(0);
+  useEffect(() => {
+    if (!active) return;
+    const gen = ++generation.current;
+    const abort = new AbortController();
+    setPending(false);
+    setConnectionState("正在连接");
+    mutationLock.current = false;
+    fetch(`/api/info?${new URLSearchParams(selectedScope)}`, { signal: abort.signal })
+      .then(async (res) => {
+        const info = await res.json();
+        if (!res.ok) throw new Error(info.error ?? `HTTP ${res.status}`);
+        if (gen !== generation.current) return;
+        setScope(info.scope);
+        connection.current = connectBackend(
+          { ...info.scope, endpoint: "same-origin" },
+          (s) => {
+            if (gen === generation.current) setSnapshot(s);
+          },
+          (state) => {
+            if (gen === generation.current) setConnectionState(state);
+          },
+          (envelope) => {
+            if (gen === generation.current) setUnresolved(envelope);
+          },
+        );
+      })
+      .catch((e) => {
+        if (!abort.signal.aborted) {
+          setError(String(e));
+          setConnectionState("连接失败");
+        }
+      });
+    return () => {
+      generation.current++;
+      editorEpoch.current++;
+      abort.abort();
+      connection.current?.close();
+      connection.current = undefined;
+    };
+  }, [reconnect, active, selectedScope]);
+  const run = snapshot?.runs.find((r) => r.id === runId);
+  const published =
+    snapshot?.versions.find((v) => v.id === (run?.versionId ?? versionId)) ??
+    (!versionId && !runId ? snapshot?.versions[0] : undefined);
+  const version = draft ?? published;
+  const edgeIdentity = JSON.stringify([
+    runId,
+    version?.id,
+    version?.graph.edges,
+  ]);
+  useEffect(() => {
+    setSelectedEdge(undefined);
+  }, [edgeIdentity]);
+  const node = version?.graph.nodes.find((n) => n.id === nodeId);
+  const member = snapshot?.members.find((m) => m.id === memberId);
+  const attempt =
+    snapshot && run && node
+      ? currentAttempt(snapshot, run.id, node.id)
+      : undefined;
+  const performMutation = async (command: TeamflowCommand, retry = false) => {
+    if (!connection.current || mutationLock.current) return;
+    mutationLock.current = true;
+    const gen = generation.current;
+    setPending(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await (retry
+        ? connection.current.retryMutation()
+        : connection.current.mutate(command));
+      if (gen !== generation.current) return;
+      if (result.inProgress)
+        setNotice(
+          `操作未确认完成 / 未排队：${result.inProgress.reason}；进行中 requestId=${result.inProgress.requestId}。保留输入，刷新后显式重新核对。`,
+        );
+      else if (command.type === "dispatch.reconcile") {
+        const task = result.snapshot.tasks.find(
+          (t) => t.id === command.payload.taskId,
+        );
+        setNotice(
+          `后端核对结果（不是自动解锁）：${pretty(command.payload.action === "inspect" ? task?.inspection : task?.reconciliation)}`,
+        );
+      } else if (command.type === "message.reconcile") {
+        const task = result.snapshot.tasks.find(t => t.messageInspection?.messageId === command.payload.messageId || t.messageRecovery?.messageId === command.payload.messageId);
+        const recovery = command.payload.action === "inspect" ? task?.messageInspection : task?.messageRecovery;
+        setNotice(command.payload.action === "adopt" ? "用户已显式授权未发出的旧意图继续；尚非原生接收或处理确认。" : `消息据证核对（不是重发或自动解锁）：${pretty(recovery)}`);
+      } else
+        setNotice(
+          `后端已提交 ${command.type}${command.type === "run.start" ? ` · runId=${command.payload.runId}` : command.type === "template.import" ? ` · version=${command.payload.version.id}` : ""} · revision ${result.revision}${result.resyncRequired ? "；通知未送达，已重新读取快照" : ""}`,
+        );
+      return result;
+    } catch (e) {
+      if (gen === generation.current)
+        setError(
+          e instanceof MutationRejectedError
+            ? `后端明确拒绝（未提交）：${String(e)}。输入已保留，可比较后显式发起新操作。`
+            : connection.current?.pendingMutation()
+              ? `提交结果未知 / 未决操作仍保留：${String(e)}。不能视为未提交；请核对或按原身份重试，不要重复启动。输入已保留。`
+              : `本次未发送：${String(e)}。输入已保留。`,
+        );
+    } finally {
+      if (gen === generation.current) {
+        mutationLock.current = false;
+        setPending(false);
+      }
+    }
+  };
+  const mutate: Mutate = (command) => performMutation(command);
+  const leaveDraft = () =>
+    (!draft && !draftPanelInput) || confirm("存在本地图或草稿面板输入，切换可能丢弃未保存编辑。请先保存/复制。继续？");
+  function selectVersion(id: string) {
+    if (!leaveDraft()) return;
+    setDraft(undefined);
+    setRunId("");
+    setVersionId(id);
+    setNodeId("");
+    setMemberId("");
+    setSelectedEdge(undefined);
+  }
+  function selectRun(id: string) {
+    if (!leaveDraft()) return;
+    setDraft(undefined);
+    setRunId(id);
+    setNodeId("");
+    setMemberId("");
+    setSelectedEdge(undefined);
+  }
+  function updateVersion(fn: (v: WorkflowVersion) => WorkflowVersion) {
+    if (version && !run) setDraft(fn(structuredClone(version)));
+  }
+  function updateNode(patch: Partial<WorkflowNode>) {
+    updateVersion((v) => ({
+      ...v,
+      graph: {
+        ...v.graph,
+        nodes: v.graph.nodes.map((n) =>
+          n.id === nodeId ? { ...n, ...patch } : n,
+        ),
+      },
+    }));
+  }
+  function updateRole(id: string, patch: Partial<WorkflowRole>) {
+    updateVersion((v) => ({
+      ...v,
+      roles: v.roles.map((r) => (r.id === id ? { ...r, ...patch } : r)),
+    }));
+  }
+  const graphNodes =
+    version?.graph.nodes.map((n, i) => {
+      const a =
+        snapshot && run ? currentAttempt(snapshot, run.id, n.id) : undefined;
+      // Topological levels keep parallel AND branches visible without a layout service.
+      const level = (id: string, seen = new Set<string>()): number => {
+        if (seen.has(id)) return 0;
+        const next = new Set(seen).add(id);
+        const parents = version.graph.edges.filter(
+          (e) => e.to === id && e.kind === "normal",
+        );
+        return parents.length
+          ? 1 + Math.max(...parents.map((e) => level(e.from, next)))
+          : 0;
+      };
+      const l = level(n.id);
+      const peers = version.graph.nodes
+        .slice(0, i)
+        .filter((p) => level(p.id) === l).length;
+      return {
+        id: n.id,
+        position: { x: l * 240, y: peers * 135 },
+        selected: n.id === nodeId,
+        className: `stage ${a?.status ?? n.kind}`,
+        data: {
+          label: (
+            <>
+              <strong>{n.name}</strong>
+              <small>
+                {n.kind} · {n.mode}
+              </small>
+              <small>
+                {a ? `${label(a.status)} · 第 ${a.round} 轮` : n.id}
+              </small>
+            </>
+          ),
+        },
+      };
+    }) ?? [];
+  const graphEdges =
+    version?.graph.edges.map((e, i) => ({
+      id: String(i),
+      source: e.from,
+      target: e.to,
+      label: e.kind === "return" ? "返工" : "",
+      animated: false,
+      style: {
+        stroke: e.kind === "return" ? "#d49748" : "#667e90",
+        strokeDasharray: e.kind === "return" ? "5 5" : undefined,
+      },
+      markerEnd: { type: MarkerType.ArrowClosed },
+      selected: selectedEdge === i,
+    })) ?? [];
+  const onConnect = (c: Connection) => {
+    if (c.source && c.target && !run)
+      updateVersion((v) => ({
+        ...v,
+        graph: {
+          ...v.graph,
+          edges: [
+            ...v.graph.edges,
+            { from: c.source!, to: c.target!, kind: edgeKind },
+          ],
+        },
+      }));
+  };
+  return (
+    <div className="app">
+      <header>
+        <div className="brand">
+          ◈ <b>Teamflow</b> <span>DEMO / 工作流控制台</span>
+        </div>
+        <div className="scope">
+          <b>{scope?.backendId ?? selectedScope.backendId}</b>
+          <code>{scope?.projectDirectory ?? "正在验证项目身份…"}</code>
+        </div>
+        <div className="connection">
+          <span
+            className={connectionState === "已连接" ? "dot online" : "dot"}
+          />
+          {connectionState}
+          <button
+            onClick={() => {
+              setError("");
+              setReconnect((x) => x + 1);
+            }}
+          >
+            重新连接
+          </button>
+        </div>
+      </header>
+      <div className="messages" aria-live="polite">
+        {error && (
+          <div className="error" role="alert">
+            {error}
+            <button onClick={() => setError("")}>关闭</button>
+          </div>
+        )}
+        {notice && (
+          <div className="notice">
+            {notice}
+            <button onClick={() => setNotice("")}>关闭</button>
+          </div>
+        )}
+        {pending && <div className="notice">正在请求后端，请勿重复提交…</div>}
+        {unresolved && (
+          <div className="notice" role="status">
+            <strong>未决操作：不能作为新操作重复提交</strong>
+            <p>
+              requestId={unresolved.requestId} · {unresolved.command.type}
+              <br />
+              {unresolved.command.type === "run.start"
+                ? `原 runId=${unresolved.command.payload.runId}`
+                : unresolved.command.type === "template.import"
+                  ? `原 version=${unresolved.command.payload.version.id}`
+                  : ""}
+              <br />
+              scope={unresolved.scope.backendId} /{" "}
+              {unresolved.scope.projectDirectory}
+            </p>
+            <button
+              disabled={pending}
+              onClick={() =>
+                void connection.current
+                  ?.refresh()
+                  .then(() =>
+                    setNotice(
+                      "已重读后端。即使原 run/版本已可见，仍可按原身份重试取回结果；不能据不存在就认定未提交。",
+                    ),
+                  )
+                  .catch((e) => setError(String(e)))
+              }
+            >
+              核对权威状态（不提交）
+            </button>
+            <button
+              disabled={pending}
+              onClick={() => void performMutation(unresolved.command, true)}
+            >
+              按原 envelope / requestId 重试
+            </button>
+            <button
+              disabled={pending}
+              onClick={async () => {
+                if (
+                  !confirm(
+                    `明确放弃跟踪 ${unresolved.requestId}？\n原操作可能已经提交，放弃不会取消它。修改需求/再次启动将是新操作，可能重复执行。请先核对原 run/版本。`,
+                  )
+                )
+                  return;
+                try {
+                  await connection.current?.forgetMutation();
+                  setNotice(
+                    "已明确放弃原操作跟踪（没有取消后端操作）；后续提交会使用新身份。",
+                  );
+                } catch (e) {
+                  setError(String(e));
+                }
+              }}
+            >
+              明确处理未决项后允许新操作
+            </button>
+            <details>
+              <summary>保留的原始 envelope / 输入</summary>
+              <Json value={unresolved} />
+            </details>
+          </div>
+        )}
+      </div>
+      <div className="workspace">
+        <aside className="sidebar">
+          <h2>模板 / 版本</h2>
+          {snapshot?.templates.map((t) => (
+            <section key={t.id}>
+              <h3>{t.name}</h3>
+              <p>{t.description}</p>
+              {snapshot.versions
+                .filter((v) => v.templateId === t.id)
+                .map((v) => (
+                  <button
+                    className={
+                      !runId && published?.id === v.id ? "nav active" : "nav"
+                    }
+                    key={v.id}
+                    onClick={() => selectVersion(v.id)}
+                  >
+                    {v.id}
+                    <small>{v.releaseNotes}</small>
+                  </button>
+                ))}
+            </section>
+          ))}
+          <h2>
+            运行实例 <span>{snapshot?.runs.length ?? 0}</span>
+          </h2>
+          {snapshot?.runs
+            .slice()
+            .reverse()
+            .map((r) => (
+              <button
+                key={r.id}
+                className={runId === r.id ? "nav active" : "nav"}
+                onClick={() => selectRun(r.id)}
+              >
+                <span className={`status ${r.status}`}>{label(r.status)}</span>
+                <b>{r.label}</b>
+                <small>{r.id}</small>
+              </button>
+            ))}
+          <h2>原始探针会话</h2>
+          {snapshot?.members
+            .filter((m) => m.legacy)
+            .map((m) => (
+              <button
+                className="nav"
+                key={m.id}
+                onClick={() => setMemberId(m.id)}
+              >
+                {m.id}
+                <small>{m.sessionId}</small>
+              </button>
+            ))}
+          <div className="muted">
+            后端唯一权威 · revision {snapshot?.revision ?? "—"}
+            <br />
+              共享草稿与独立设计：图下方；单实例 patch：运行视图。
+          </div>
+        </aside>
+        <main>
+          {member && snapshot ? (
+            <SessionView
+              key={member.sessionId}
+              member={member}
+              active={active}
+              snapshot={snapshot}
+              connection={connection.current}
+              mutate={mutate}
+              mutationPending={pending || !!unresolved}
+              back={() => setMemberId("")}
+              open={setMemberId}
+            />
+          ) : (
+            <>
+              <div className="page-title">
+                <div>
+                  <span className="eyebrow">
+                    {run ? "实例 / 后端实时状态" : "模板 / 不可变发布版本"}
+                  </span>
+                  <h1>
+                    {run?.label ??
+                      snapshot?.templates.find(
+                        (t) => t.id === version?.templateId,
+                      )?.name ??
+                      "正在载入工作流…"}
+                  </h1>
+                  <code>{run?.id ?? version?.id}</code>
+                </div>
+                {run && (
+                  <span className={`status ${run.status}`}>
+                    {label(run.status)}
+                  </span>
+                )}
+              </div>
+              {snapshot && !run && <DraftView active={active} snapshot={snapshot} version={published} localVersion={draft}
+                pending={pending || !!unresolved} mutate={mutate} connection={connection.current}
+                touched={() => { editorEpoch.current++; setDraftPanelInput(true); }}
+                input={draftPanelText} setInput={setDraftPanelText} editorEpoch={editorEpoch}
+                preview={(v) => {
+                  if (draft && pretty({ graph: draft.graph, roles: draft.roles }) !== pretty({ graph: v.graph, roles: v.roles }) &&
+                    !confirm("图编辑器已有未保存的本地图/提示词输入。预览此面板草稿将替换它们（不会自动保存）。取消可完整保留当前图；请先采用到面板或复制备份。明确替换？")) return;
+                  setDraft(v); setNodeId(""); setMemberId("");
+                }}
+              />}
+              {snapshot && run && <PatchView key={run.id} snapshot={snapshot} runId={run.id} pending={pending || !!unresolved} mutate={mutate} />}
+              {version && (
+                <>
+                  <div className="toolbar">
+                    <span>
+                      {version.graph.nodes.length} 节点 ·{" "}
+                      {version.graph.edges.length} 连线 · {version.id}
+                    </span>
+                    {run ? (
+                      <>
+                        <button
+                          disabled={
+                            pending ||
+                            !["running", "waiting"].includes(run.status)
+                          }
+                          onClick={() =>
+                            void mutate({
+                              type: "run.pause",
+                              payload: { runId: run.id },
+                            })
+                          }
+                        >
+                          暂停调度
+                        </button>
+                        <button
+                          disabled={pending || run.status !== "paused"}
+                          onClick={() =>
+                            void mutate({
+                              type: "run.resume",
+                              payload: { runId: run.id },
+                            })
+                          }
+                        >
+                          恢复调度
+                        </button>
+                        <button
+                          className="danger"
+                          disabled={
+                            pending ||
+                            ["completed", "cancelled"].includes(run.status)
+                          }
+                          onClick={() => {
+                            if (
+                              confirm(
+                                "取消此实例并请求中断其执行？未核对安全前后端可能继续保留租约。",
+                              )
+                            )
+                              void mutate({
+                                type: "run.cancel",
+                                payload: { runId: run.id },
+                              });
+                          }}
+                        >
+                          取消实例
+                        </button>
+                        <button onClick={() => selectVersion(version.id)}>
+                          查看原始模板
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button
+                          onClick={() => {
+                            setDraft(
+                              (existing) =>
+                                existing ?? structuredClone(version),
+                            );
+                          }}
+                        >
+                          建立本地草稿
+                        </button>
+                        {draft && (
+                          <>
+                            <span className="draft-badge">
+                              本地未保存 · 仅此页面
+                            </span>
+                            <button
+                              onClick={() => {
+                                if (confirm("丢弃本地草稿？"))
+                                  setDraft(undefined);
+                              }}
+                            >
+                              丢弃草稿
+                            </button>
+                          </>
+                        )}
+                      </>
+                    )}
+                    <button
+                      onClick={() =>
+                        void connection.current
+                          ?.refresh()
+                          .catch((e) => setError(String(e)))
+                      }
+                    >
+                      刷新后端
+                    </button>
+                  </div>
+                  {run && (
+                    <div className="run-summary">
+                      <strong>{run.waitingReason ?? "无等待原因"}</strong>
+                      <p>{run.brief}</p>
+                      <small>
+                        槽{" "}
+                        {
+                          snapshot?.tasks.filter(
+                            (t) => t.runId === run.id && t.slotHeld,
+                          ).length
+                        }
+                        /{run.config.activeSlots} · 子深度{" "}
+                        {run.config.childDepth} · 返工预算{" "}
+                        {run.config.reworkAttempts}
+                      </small>
+                    </div>
+                  )}
+                  <div className="graph" aria-label="工作流图">
+                    <ReactFlow
+                      key={`${runId}:${version.id}`}
+                      nodes={graphNodes}
+                      edges={graphEdges}
+                      onNodeClick={(_, n) => setNodeId(n.id)}
+                      onEdgeClick={(_, e) => setSelectedEdge(Number(e.id))}
+                      onConnect={onConnect}
+                      nodesDraggable={false}
+                      nodesConnectable={!run}
+                      fitView
+                      fitViewOptions={{ padding: 0.15 }}
+                      minZoom={0.25}
+                      maxZoom={1.5}
+                    >
+                      <Background gap={24} />
+                      <Controls />
+                      <MiniMap />
+                    </ReactFlow>
+                  </div>
+                  {!run && (
+                    <div className="toolbar">
+                      <small>
+                        点击节点检查 /
+                        编辑；拖动连接点增加边，点击边后删除。改动均为本地草稿。
+                      </small>
+                      <select
+                        aria-label="新增连线类型"
+                        value={edgeKind}
+                        onChange={(e) =>
+                          setEdgeKind(e.target.value as typeof edgeKind)
+                        }
+                      >
+                        <option value="normal">正常依赖（AND）</option>
+                        <option value="return">返工边</option>
+                      </select>
+                      <button
+                        disabled={selectedEdge === undefined}
+                        onClick={() => {
+                          updateVersion((v) => ({
+                            ...v,
+                            graph: {
+                              ...v.graph,
+                              edges: v.graph.edges.filter(
+                                (_, i) => i !== selectedEdge,
+                              ),
+                            },
+                          }));
+                          setSelectedEdge(undefined);
+                        }}
+                      >
+                        删除选中连线
+                      </button>
+                      <button
+                        onClick={() => {
+                          const id = prompt("新节点 ID（唯一）");
+                          if (id) {
+                            updateVersion((v) => ({
+                              ...v,
+                              graph: {
+                                ...v.graph,
+                                nodes: [
+                                  ...v.graph.nodes,
+                                  {
+                                    id,
+                                    name: id,
+                                    kind: "end",
+                                    mode: "demo",
+                                    prompt: "填写节点说明",
+                                    inputs: [],
+                                    deliverables: [],
+                                    criteria: [],
+                                    criteriaRevision: "1",
+                                    writes: false,
+                                  },
+                                ],
+                              },
+                            }));
+                            setNodeId(id);
+                          }
+                        }}
+                      >
+                        添加节点
+                      </button>
+                    </div>
+                  )}
+                  <div className="detail-layout">
+                    <section className="panel">
+                      {node ? (
+                        <NodeEditor
+                          key={`${runId}:${version.id}:${node.id}`}
+                          node={node}
+                          version={version}
+                          readOnly={!!run}
+                          update={updateNode}
+                          updateRole={updateRole}
+                          updateVersion={updateVersion}
+                        />
+                      ) : (
+                        <div className="empty">
+                          <h2>点击图中的节点</h2>
+                          <p>
+                            检查提示词、角色、产物与
+                            Gate；运行中的配置只读，编辑请发布模板新版本。
+                          </p>
+                        </div>
+                      )}
+                    </section>
+                    <section className="panel">
+                      {run && snapshot ? (
+                        <RunEvidence
+                          key={`${runId}:${node?.id ?? "overview"}`}
+                          snapshot={snapshot}
+                          runId={run.id}
+                          version={version}
+                          node={node}
+                          attempt={attempt}
+                          mutate={mutate}
+                          pending={pending}
+                          openMember={setMemberId}
+                        />
+                      ) : (
+                        <>
+                          <h2>启动工作流</h2>
+                          <p className="muted">
+                            仅启动已发布版本。不会使用上方本地草稿。实际成员由后端派工。
+                          </p>
+                          <Field
+                            title="实例名称"
+                            value={runLabel}
+                            onChange={setRunLabel}
+                          />
+                          <Field
+                            title="任务说明"
+                            value={brief}
+                            onChange={setBrief}
+                            multiline
+                          />
+                          <div className="numbers">
+                            {[
+                              ["执行槽", slots, setSlots, 1, 16],
+                              ["子深度", depth, setDepth, 0, 2],
+                              ["返工预算", reworks, setReworks, 0, 10],
+                            ].map(([name, value, setter, min, max]) => (
+                              <label key={String(name)}>
+                                {String(name)}
+                                <input
+                                  type="number"
+                                  min={Number(min)}
+                                  max={Number(max)}
+                                  value={Number(value)}
+                                  onChange={(e) =>
+                                    (setter as (n: number) => void)(
+                                      Number(e.target.value),
+                                    )
+                                  }
+                                />
+                              </label>
+                            ))}
+                          </div>
+                          <button
+                            className="primary"
+                            disabled={
+                              pending ||
+                              !!unresolved ||
+                              !!draft ||
+                              !runLabel.trim() ||
+                              !brief.trim()
+                            }
+                            onClick={async () => {
+                              const epoch = editorEpoch.current;
+                              const id = `DEMO-web-${crypto.randomUUID()}`;
+                              const result = await mutate({
+                                type: "run.start",
+                                payload: {
+                                  runId: id,
+                                  versionId: version.id,
+                                  label: runLabel,
+                                  brief,
+                                  config: {
+                                    activeSlots: slots,
+                                    childDepth: depth,
+                                    reworkAttempts: reworks,
+                                  },
+                                },
+                              });
+                              if (
+                                result &&
+                                 !result.inProgress &&
+                                 !draftPanelInput &&
+                                 epoch === editorEpoch.current
+                              ) {
+                                setRunId(id);
+                                setDraft(undefined);
+                                setSelectedEdge(undefined);
+                                setRunLabel("");
+                                setBrief("");
+                              }
+                            }}
+                          >
+                            启动已发布版本
+                          </button>
+                          <p>本地修改请在“共享草稿 / 独立设计会话”采用并保存，经过独立设计后显式发布。</p>
+                          <details>
+                            <summary>导入完整 template / version JSON</summary>
+                            <Field
+                              title="严格协议 {template, version}；digest 须有效"
+                              value={importText}
+                              onChange={setImportText}
+                              multiline
+                            />
+                            <button
+                              disabled={pending || !!unresolved || !importText}
+                              onClick={async () => {
+                                try {
+                                  const input = JSON.parse(importText);
+                                  const template = TemplateSchema.parse(
+                                      input.template,
+                                    ),
+                                    v = VersionSchema.parse(input.version);
+                                  if (!confirm(`导入不可变版本 ${v.id}？`))
+                                    return;
+                                  const epoch = editorEpoch.current;
+                                  const hadDraft = !!draft;
+                                  const result = await mutate({
+                                    type: "template.import",
+                                    payload: { template, version: v },
+                                  });
+                                  if (result && !result.inProgress) {
+                                    if (
+                                      hadDraft ||
+                                      epoch !== editorEpoch.current
+                                    ) {
+                                      setNotice(
+                                        `版本 ${v.id} 已导入；当前本地草稿/输入与选择保留，不自动切换。`,
+                                      );
+                                    } else {
+                                      setRunId("");
+                                      setVersionId(v.id);
+                                      setNodeId("");
+                                      setSelectedEdge(undefined);
+                                      setImportText("");
+                                    }
+                                  }
+                                } catch (e) {
+                                  setError(String(e));
+                                }
+                              }}
+                            >
+                              提交导入
+                            </button>
+                          </details>
+                          <details>
+                            <summary>发布版本元数据 / 导出</summary>
+                            <Json value={published} />
+                          </details>
+                        </>
+                      )}
+                    </section>
+                  </div>
+                </>
+              )}
+            </>
+          )}
+        </main>
+      </div>
+      <footer>
+        Teamflow 功能 Demo · 不代表用户验收 · 状态、批准、派工均以真实后端为准
+      </footer>
+    </div>
+  );
+}
+
+function NodeEditor({
+  node,
+  version,
+  readOnly,
+  update,
+  updateRole,
+  updateVersion,
+}: {
+  node: WorkflowNode;
+  version: WorkflowVersion;
+  readOnly: boolean;
+  update: (p: Partial<WorkflowNode>) => void;
+  updateRole: (id: string, p: Partial<WorkflowRole>) => void;
+  updateVersion: (fn: (v: WorkflowVersion) => WorkflowVersion) => void;
+}) {
+  const role = version.roles.find((r) => r.id === node.role);
+  const field = (
+    title: string,
+    value: string,
+    fn: (v: string) => void,
+    multiline = false,
+  ) => (
+    <Field
+      title={title}
+      value={value}
+      onChange={readOnly ? undefined : fn}
+      multiline={multiline}
+    />
+  );
+  return (
+    <>
+      <div className="section-heading">
+        <h2>节点 · {node.name}</h2>
+        <span className="muted">
+          {readOnly ? "运行配置只读" : "编辑产生本地未保存草稿"}
+        </span>
+      </div>
+      <code>{node.id}</code>
+      {field("名称", node.name, (name) => update({ name }))}
+      <div className="numbers">
+        <label>
+          节点类型
+          <select
+            disabled={readOnly}
+            value={node.kind}
+            onChange={(e) =>
+              update({
+                kind: e.target.value as WorkflowNode["kind"],
+                gate:
+                  e.target.value === "gate"
+                    ? { user: true, reviewRoles: [], testRoles: [] }
+                    : undefined,
+              })
+            }
+          >
+            {["work", "review", "test", "gate", "end"].map((k) => (
+              <option key={k}>{k}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          模式
+          <select
+            disabled={readOnly}
+            value={node.mode}
+            onChange={(e) =>
+              update({ mode: e.target.value as WorkflowNode["mode"] })
+            }
+          >
+            {["demo", "analysis", "formal"].map((k) => (
+              <option key={k}>{k}</option>
+            ))}
+          </select>
+        </label>
+      </div>
+      {field("节点提示词", node.prompt, (prompt) => update({ prompt }), true)}
+      <label className="field">
+        角色
+        <select
+          disabled={readOnly}
+          value={node.role ?? ""}
+          onChange={(e) => update({ role: e.target.value || undefined })}
+        >
+          <option value="">无角色</option>
+          {version.roles.map((r) => (
+            <option key={r.id}>{r.id}</option>
+          ))}
+        </select>
+      </label>
+      <label className="check">
+        <input
+          type="checkbox"
+          disabled={readOnly}
+          checked={node.writes}
+          onChange={(e) => update({ writes: e.target.checked })}
+        />
+        需要写权限 / 写租约
+      </label>
+      {(["inputs", "deliverables", "criteria"] as const).map((key, i) => (
+        <React.Fragment key={key}>
+          {field(
+            ["输入（每行一项）", "交付物（每行一项）", "验收标准（每行一项）"][
+              i
+            ],
+            node[key].join("\n"),
+            (value) => update({ [key]: lines(value) }),
+            true,
+          )}
+        </React.Fragment>
+      ))}
+      {field(
+        "验收标准版本（与源 work / 检查 / Gate 一致）",
+        node.criteriaRevision,
+        (criteriaRevision) => update({ criteriaRevision }),
+      )}
+      {field("交付源节点 ID", node.sourceNodeId ?? "", (sourceNodeId) =>
+        update({ sourceNodeId: sourceNodeId || undefined }),
+      )}
+      {node.gate && (
+        <fieldset>
+          <legend>Gate · 后端判断通过</legend>
+          <label className="check">
+            <input
+              type="checkbox"
+              disabled={readOnly}
+              checked={node.gate.user}
+              onChange={(e) =>
+                update({ gate: { ...node.gate!, user: e.target.checked } })
+              }
+            />
+            需要用户显式批准
+          </label>
+          {field(
+            "必需 review 角色（每行一项）",
+            node.gate.reviewRoles.join("\n"),
+            (v) => update({ gate: { ...node.gate!, reviewRoles: lines(v) } }),
+            true,
+          )}
+          {field(
+            "必需 test 角色（每行一项）",
+            node.gate.testRoles.join("\n"),
+            (v) => update({ gate: { ...node.gate!, testRoles: lines(v) } }),
+            true,
+          )}
+        </fieldset>
+      )}
+      {role && (
+        <fieldset>
+          <legend>角色配置 · {role.id}（使用此角色的节点共用）</legend>
+          {(["agent", "responsibility", "prompt"] as const).map((key) => (
+            <React.Fragment key={key}>
+              {field(
+                {
+                  agent: "原生 Agent",
+                  responsibility: "职责",
+                  prompt: "角色提示词",
+                }[key],
+                role[key],
+                (v) => updateRole(role.id, { [key]: v }),
+                key !== "agent",
+              )}
+            </React.Fragment>
+          ))}
+          {field(
+            "模型 providerID（留空使用后端默认）",
+            role.model?.providerID ?? "",
+            (v) =>
+              updateRole(role.id, {
+                model: v
+                  ? { providerID: v, id: role.model?.id ?? "" }
+                  : undefined,
+              }),
+          )}
+          {field("模型 ID", role.model?.id ?? "", (v) =>
+            updateRole(role.id, {
+              model: { providerID: role.model?.providerID ?? "", id: v },
+            }),
+          )}
+          {(["permissions", "skills", "childRoles"] as const).map((key, i) => (
+            <React.Fragment key={key}>
+              {field(
+                [
+                  "权限（每行一项）",
+                  "Skill（每行一项）",
+            "允许子角色（受角色/深度/调度槽限制）",
+                ][i],
+                role[key].join("\n"),
+                (v) => updateRole(role.id, { [key]: lines(v) }),
+                true,
+              )}
+            </React.Fragment>
+          ))}
+          <label className="field">
+            最大子深度（0–2）
+            <input
+              disabled={readOnly}
+              type="number"
+              min={0}
+              max={2}
+              value={role.maxDepth}
+              onChange={(e) =>
+                updateRole(role.id, { maxDepth: Number(e.target.value) })
+              }
+            />
+          </label>
+        </fieldset>
+      )}
+      {!readOnly && (
+        <>
+          <fieldset>
+            <legend>图约束</legend>
+            {field("入口节点", version.graph.entry, (entry) =>
+              updateVersion((v) => ({ ...v, graph: { ...v.graph, entry } })),
+            )}
+            {field(
+              "必需 Gate ID（每行一项）",
+              version.graph.requiredGateIds.join("\n"),
+              (v) =>
+                updateVersion((x) => ({
+                  ...x,
+                  graph: { ...x.graph, requiredGateIds: lines(v) },
+                })),
+              true,
+            )}
+          </fieldset>
+          <button
+            onClick={() => {
+              const id = prompt("新角色 ID");
+              if (id)
+                updateVersion((v) => ({
+                  ...v,
+                  roles: [
+                    ...v.roles,
+                    {
+                      id,
+                      agent: "build",
+                      responsibility: "填写职责",
+                      prompt: "填写提示词",
+                      permissions: [],
+                      skills: [],
+                      childRoles: [],
+                      maxDepth: 0,
+                    },
+                  ],
+                }));
+            }}
+          >
+            添加角色
+          </button>
+          <button
+            className="danger"
+            onClick={() => {
+              if (
+                confirm(
+                  `删除节点 ${node.id} 及其连线？请修正入口/源/Gate引用。`,
+                )
+              )
+                updateVersion((v) => ({
+                  ...v,
+                  graph: {
+                    ...v.graph,
+                    nodes: v.graph.nodes.filter((n) => n.id !== node.id),
+                    edges: v.graph.edges.filter(
+                      (e) => e.from !== node.id && e.to !== node.id,
+                    ),
+                  },
+                }));
+            }}
+          >
+            删除节点
+          </button>
+        </>
+      )}
+    </>
+  );
+}
+
+function RunEvidence({
+  snapshot: s,
+  runId,
+  version,
+  node,
+  attempt,
+  mutate,
+  pending,
+  openMember,
+}: {
+  snapshot: TeamflowSnapshot;
+  runId: string;
+  version: WorkflowVersion;
+  node?: WorkflowNode;
+  attempt?: StageAttempt;
+  mutate: Mutate;
+  pending: boolean;
+  openMember: (id: string) => void;
+}) {
+  const [reason, setReason] = useState("");
+  const sourceAttempt = node?.sourceNodeId
+    ? currentAttempt(s, runId, node.sourceNodeId)
+    : attempt;
+  const delivery = s.deliveries
+    .filter((d) => d.attemptId === sourceAttempt?.id)
+    .at(-1);
+  const tasks = s.tasks.filter(
+    (t) => t.runId === runId && (!node || t.attemptId === attempt?.id),
+  );
+  const members = s.members.filter(
+    (m) =>
+      m.runId === runId && (!node || tasks.some((t) => t.memberId === m.id)),
+  );
+  const binding =
+    attempt && delivery
+      ? {
+          attemptId: attempt.id,
+          deliveryId: delivery.id,
+          artifactRevision: delivery.artifactRevision,
+          criteriaRevision: delivery.criteriaRevision,
+        }
+      : undefined;
+  const approve = async (reject: boolean) => {
+    if (!binding) return;
+    if (
+      !confirm(
+        `${reject ? "打回返工" : "批准此 Gate"}？\n${pretty(binding)}\n此操作仅代表你对此次交付的明确决定。`,
+      )
+    )
+      return;
+    const result = await mutate(
+      reject
+        ? { type: "gate.reject", payload: { ...binding, reason } }
+        : { type: "gate.approve", payload: binding },
+    );
+    if (result && !result.inProgress) setReason("");
+  };
+  return (
+    <>
+      <h2>{node ? "执行 / 交付证据" : "实例概览"}</h2>
+      {attempt && (
+        <div className="run-summary">
+          <span className={`status ${attempt.status}`}>
+            {label(attempt.status)}
+          </span>
+          <p>
+            第 {attempt.round} 轮 · {attempt.id}
+          </p>
+          <p>{attempt.reason}</p>
+          <small>criteriaRevision: {attempt.criteriaRevision}</small>
+        </div>
+      )}
+      {!node &&
+        s.attempts
+          .filter(
+            (a) =>
+              a.runId === runId &&
+              currentAttempt(s, runId, a.nodeId)?.id === a.id,
+          )
+          .map((a) => (
+            <p key={a.id}>
+              <b>{a.nodeId}</b> · {label(a.status)} · 第{a.round}轮 {a.reason}
+            </p>
+          ))}
+      {delivery ? (
+        <article>
+          <h3>当前源交付</h3>
+          <p>{delivery.summary}</p>
+          <dl>
+            <dt>delivery / source attempt</dt>
+            <dd>
+              {delivery.id}
+              <br />
+              {delivery.attemptId}
+            </dd>
+            <dt>artifact / criteria</dt>
+            <dd>
+              {delivery.artifactRevision} / {delivery.criteriaRevision}
+            </dd>
+            <dt>产物</dt>
+            <dd>{delivery.artifacts.join("\n")}</dd>
+            <dt>未解决问题</dt>
+            <dd>{delivery.unresolved.join("\n") || "无申报问题"}</dd>
+          </dl>
+          {delivery.checks.map((c, i) => (
+            <details key={i} open>
+              <summary>
+                {c.source} · exit {c.exitCode} · {c.command}
+              </summary>
+              <p>版本 {c.version}</p>
+              <pre>{c.output}</pre>
+            </details>
+          ))}
+        </article>
+      ) : (
+        <p className="muted">当前尝试尚无交付；无交付不代表通过。</p>
+      )}
+      {node?.kind === "gate" && (
+        <fieldset>
+          <legend>用户决定</legend>
+          <p>仅当前 Gate 与源节点最高轮交付。后端仍核对专业检查及版本。</p>
+          {binding && <Json value={binding} />}
+          <Field
+            title="打回原因"
+            value={reason}
+            onChange={setReason}
+            multiline
+          />
+          <button
+            className="primary"
+            disabled={
+              pending ||
+              !binding ||
+              !node.gate?.user ||
+              attempt?.status !== "awaiting_gate"
+            }
+            onClick={() => void approve(false)}
+          >
+            明确批准此交付
+          </button>
+          <button
+            className="danger"
+            disabled={
+              pending ||
+              !binding ||
+              !reason.trim() ||
+              !attempt ||
+              ["passed", "superseded", "cancelled"].includes(attempt.status)
+            }
+            onClick={() => void approve(true)}
+          >
+            打回并要求返工
+          </button>
+        </fieldset>
+      )}
+      <h3>批准记录（含失效记录）</h3>
+      {s.approvals
+        .filter(
+          (a) =>
+            a.runId === runId &&
+            (!node ||
+              a.attemptId === attempt?.id ||
+              a.targetAttemptId === sourceAttempt?.id),
+        )
+        .map((a) => (
+          <details key={a.id}>
+            <summary>
+              {a.kind} · {a.verdict} · {a.valid ? "后端有效" : "已失效"}
+            </summary>
+            <Json value={a} />
+          </details>
+        ))}
+      <h3>成员 / 原始会话</h3>
+      {members.map((m) => (
+        <button className="member" key={m.id} onClick={() => openMember(m.id)}>
+          <strong>{m.role}</strong>
+          <small>
+            {m.id}
+            <br />
+            {m.sessionId}
+          </small>
+          打开会话 →
+        </button>
+      ))}
+      <h3>派工与租约</h3>
+      {tasks.map((t) => (
+        <TaskControl key={t.id} task={t} mutate={mutate} pending={pending} />
+      ))}
+      <details>
+        <summary>历史尝试、交付与全实例成员</summary>
+        <h4>历史批准（包含已失效记录）</h4>
+        <Json value={s.approvals.filter((a) => a.runId === runId)} />
+        <h4>历史派工（不自动恢复）</h4>
+        <Json value={s.tasks.filter((t) => t.runId === runId)} />
+        <h4>历史定义快照（按 attempt.versionId，不按实例新版本重解释）</h4>
+        {[...new Set(s.attempts.filter(a => a.runId === runId).map(a => a.versionId ?? version.id))].map(id => (
+          <details key={id}><summary>{id}</summary><Json value={s.versions.find(v => v.id === id)} /></details>
+        ))}
+        <Json
+          value={s.attempts.filter(
+            (a) => a.runId === runId && (!node || a.nodeId === node.id),
+          )}
+        />
+        <Json
+          value={s.deliveries.filter(
+            (d) =>
+              d.runId === runId &&
+              (!node ||
+                s.attempts.some(
+                  (a) =>
+                    a.id === d.attemptId &&
+                    (a.nodeId === node.id || a.nodeId === node.sourceNodeId),
+                )),
+          )}
+        />
+        {s.members
+          .filter((m) => m.runId === runId)
+          .map((m) => (
+            <button key={m.id} onClick={() => openMember(m.id)}>
+              {m.role} · {m.sessionId}
+            </button>
+          ))}
+      </details>
+      <CollaborationPanel snapshot={s} runId={runId} mutate={mutate} pending={pending} />
+      <details>
+        <summary>实例模板 {version.id} / 审计</summary>
+        <Json value={s.audit.slice(-30)} />
+      </details>
+    </>
+  );
+}
+function TaskControl({
+  task: t,
+  mutate,
+  pending,
+}: {
+  task: Task;
+  mutate: Mutate;
+  pending: boolean;
+}) {
+  const [reason, setReason] = useState(""),
+    [sessionId, setSessionId] = useState("");
+  async function reconcile(action: "inspect" | "bind" | "terminate") {
+    if (
+      action !== "inspect" &&
+      !confirm(
+        `请求后端${action === "bind" ? "绑定已有真实执行（不重发）" : "停止并安全终止此派工"}？\n${t.id}\n原因：${reason}\nblocked/进行中不代表解锁。`,
+      )
+    )
+      return;
+    await mutate({
+      type: "dispatch.reconcile",
+      payload: {
+        taskId: t.id,
+        action,
+        reason,
+        ...(sessionId ? { sessionId } : {}),
+      },
+    });
+  }
+  return (
+    <article>
+      <h4>{t.id}</h4>
+      <p>
+        {label(t.status)} ·{" "}
+        {t.slotHeld ? "占用执行槽 / 可能持写租约" : "未占槽"} ·{" "}
+        {t.writes ? "写任务" : "只读任务"}
+      </p>
+      {t.error && <p className="error">{t.error}</p>}
+      <details open={t.status === "uncertain"}>
+        <summary>派工阶段、核对结果与证据</summary>
+        <Json
+          value={{
+            sessionId: t.sessionId,
+            dispatch: t.dispatch,
+            inspection: t.inspection,
+            reconciliation: t.reconciliation,
+          }}
+        />
+      </details>
+      {(t.status === "uncertain" ||
+        t.slotHeld ||
+        t.inspection ||
+        t.reconciliation) && (
+        <>
+          <Field
+            title="核对理由（必填，失败保留）"
+            value={reason}
+            onChange={setReason}
+          />
+          <Field
+            title="待核对 sessionId（可选，不改变已绑定 ID）"
+            value={sessionId}
+            onChange={setSessionId}
+          />
+          <button
+            disabled={pending || !reason.trim()}
+            onClick={() => void reconcile("inspect")}
+          >
+            重新核对（新 requestId）
+          </button>
+          <button
+            disabled={pending || !reason.trim() || t.status !== "uncertain"}
+            onClick={() => void reconcile("bind")}
+          >
+            请求绑定已有执行
+          </button>
+          <button
+            className="danger"
+            disabled={pending || !reason.trim()}
+            onClick={() => void reconcile("terminate")}
+          >
+            请求安全终止
+          </button>
+        </>
+      )}
+    </article>
+  );
+}
+
+function SessionView({
+  member,
+  active,
+  snapshot,
+  connection,
+  mutate,
+  mutationPending,
+  back,
+  open,
+}: {
+  member: Member;
+  active: boolean;
+  snapshot: TeamflowSnapshot;
+  connection?: TeamflowConnection;
+  mutate: Mutate;
+  mutationPending: boolean;
+  back: () => void;
+  open: (id: string) => void;
+}) {
+  const [messages, setMessages] = useState<unknown[]>([]),
+    [text, setText] = useState(""),
+    [error, setError] = useState(""),
+    [sendError, setSendError] = useState(""),
+    [notice, setNotice] = useState(""),
+    [pending, setPending] = useState(false),
+    [loading, setLoading] = useState(true);
+  const [topicId, setTopicId] = useState(""), [unrelatedReason, setUnrelatedReason] = useState("");
+  const sequence = useRef(0);
+  const sendGeneration = useRef(0);
+  const alive = useRef(true);
+  const task = snapshot.tasks.find((t) => t.sessionId === member.sessionId);
+  const canSend =
+    !member.legacy && !!task && ["running", "submitted"].includes(task.status) && !task.child?.staleBy &&
+    !["cancelled", "failed"].includes(snapshot.runs.find(r => r.id === member.runId)?.status ?? "failed");
+  async function load() {
+    const seq = ++sequence.current;
+    try {
+      if (!connection) throw new Error("连接尚未就绪");
+      const result = await connection.sessionMessages(member.sessionId);
+      if (alive.current && seq === sequence.current) {
+        setMessages(result);
+        setError("");
+        setLoading(false);
+      }
+    } catch (e) {
+      if (alive.current && seq === sequence.current) {
+        setError(
+          `读取原生会话失败：${String(e)}。成员和 session ID 保留，可刷新重试；不自动创建替代会话。`,
+        );
+        setLoading(false);
+      }
+    }
+  }
+  useEffect(() => {
+    sendGeneration.current++;
+    setPending(false);
+    if (!active) {
+      setMessages([]);
+      setLoading(true);
+      setError("");
+      return;
+    }
+    alive.current = true;
+    void load();
+    const timer = setInterval(() => void load(), 5000);
+    return () => {
+      alive.current = false;
+      sendGeneration.current++;
+      sequence.current++;
+      clearInterval(timer);
+    };
+  }, [connection, member.sessionId, active]);
+  async function send() {
+    if (!connection || !active || pending || mutationPending) return;
+    const generation = sendGeneration.current;
+    const currentSend = () => alive.current && generation === sendGeneration.current;
+    setPending(true);
+    setSendError("");
+    setNotice("");
+    const sentText = text;
+    try {
+      const result = await mutate({ type: "message.send", payload: { runId: member.runId, toMemberId: member.id, text: sentText, ...(topicId ? { topicId } : unrelatedReason ? { unrelatedReason } : {}) } });
+      if (!result) return;
+      if (currentSend()) {
+        setNotice("消息意图已持久化；原生接收与成员处理确认分开追踪。输入保留，不自动重发。");
+        await load();
+      }
+    } catch (e) {
+      if (currentSend()) setSendError(`${String(e)}；消息输入已保留。`);
+    } finally {
+      if (currentSend()) setPending(false);
+    }
+  }
+  return (
+    <>
+      <button onClick={back}>← 返回流程</button>
+      <div className="page-title">
+        <div>
+          <span className="eyebrow">成员 / 原生 OpenCode 会话</span>
+          <h1>{member.role}</h1>
+          <code>{member.sessionId}</code>
+          <p>
+            {member.id} · run {member.runId}
+          </p>
+        </div>
+        <button onClick={() => void load()}>刷新消息与工具状态</button>
+      </div>
+      <p className="muted">
+        原始 session ID
+        保持不变。消息来自原生上下文；没有完整响应前不推断成员空闲或完成。
+      </p>
+      {error && (
+        <div className="error" role="alert">
+          {error}
+        </div>
+      )}
+      {sendError && (
+        <div className="error" role="alert">
+          {sendError}
+        </div>
+      )}
+      {notice && <div className="notice">{notice}</div>}
+      <div className="panel session-messages">
+        {loading
+          ? "读取原生会话…"
+          : messages.length === 0
+            ? error
+              ? "读取失败，尚未取得原生消息。"
+              : "原生上下文暂无消息"
+            : messages.map((message, i) => (
+                <NativeMessage key={i} value={message} />
+              ))}
+      </div>
+      <section className="panel">
+        <h2>向此成员发送指示</h2>
+        <p>
+          {canSend
+             ? "同一原生会话继续；调度器获取槽位/写租约后恢复，不重交旧工作/通过结论；原专业成员可对仍有效的同一交付登记迟到负面结论。"
+             : "已取消 / 被替换 / 不确定 / 过期会话只读，不复活旧工作。"}
+        </p>
+        <Field
+          title="消息（失败保留，最多 32000 字符）"
+          value={text}
+          onChange={setText}
+          multiline
+        />
+        <label className="field">消息关联议题<select value={topicId} onChange={e => setTopicId(e.target.value)}><option value="">无关联（歧义时须填写无关原因）</option>{snapshot.topics.filter(t => t.runId === member.runId).map(t => <option key={t.id} value={t.id}>{t.id} · {t.status}</option>)}</select></label>
+        <Field title="与已有议题无关的明确原因" value={unrelatedReason} onChange={setUnrelatedReason} />
+        <button
+          className="primary"
+            disabled={!canSend || pending || mutationPending || !text.trim() || text.length > 32000}
+          onClick={() => void send()}
+        >
+          {pending ? "正在发送…" : "发送到原始会话"}
+        </button>
+        <h3>子成员</h3>
+        {snapshot.members
+          .filter((m) => m.parentMemberId === member.id)
+          .map((m) => (
+            <button key={m.id} onClick={() => open(m.id)}>
+              {m.role} · {m.sessionId}
+            </button>
+          ))}
+        <p className="muted">子成员由真实成员工具登记创建；消息、议题及纠偏跟踪见流程中的协作面板。</p>
+      </section>
+    </>
+  );
+}
+function NativeMessage({ value }: { value: unknown }) {
+  if (!value || typeof value !== "object") return <Json value={value} />;
+  const record = value as Record<string, any>;
+  const parts = Array.isArray(record.parts)
+    ? record.parts
+    : Array.isArray(record.content)
+      ? record.content
+      : [];
+  return (
+    <article className="native-message">
+      <h3>
+        {record.info?.role ?? record.role ?? record.type ?? "原生消息"}{" "}
+        <small>{record.info?.id ?? record.id}</small>
+      </h3>
+      {typeof record.text === "string" && <pre>{record.text}</pre>}
+      {parts.map((p: Record<string, any>, i: number) =>
+        p.type === "text" ? (
+          <pre key={i}>{p.text}</pre>
+        ) : p.type === "tool" || p.tool ? (
+          <details key={i} open>
+            <summary>
+              工具 {p.tool ?? p.name} ·{" "}
+              {p.state?.status ?? p.status ?? "未知状态"}
+            </summary>
+            <Json value={p} />
+          </details>
+        ) : (
+          <details key={i}>
+            <summary>{p.type ?? "消息部分"}</summary>
+            <Json value={p} />
+          </details>
+        ),
+      )}
+      <details>
+        <summary>查看原生结构</summary>
+        <Json value={value} />
+      </details>
+    </article>
+  );
+}
+
+createRoot(document.getElementById("root")!).render(
+  <React.StrictMode>
+    <BackendChooser workspace={(scope, active) => <App selectedScope={scope} active={active} />} />
+  </React.StrictMode>,
+);
