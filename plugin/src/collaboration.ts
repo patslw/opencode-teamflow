@@ -12,11 +12,11 @@ export function enqueue(s: TeamflowSnapshot, runId: string, from: string, to: st
     status: "intent", continuationAuthorized: true, taskId: s.members.find(m => m.id === to && m.runId === runId)?.taskId, createdAt: now(), ...extra };
   s.messages.push(m); return m.id;
 }
-function memberActor(s: TeamflowSnapshot, actor: ActorContext, runId: string) {
+function memberActor(s: TeamflowSnapshot, actor: ActorContext, runId: string, allowPausedReceipt = false) {
   if (actor.kind !== "agent") throw new Error("Real registered member session required");
   const m = s.members.find(m => m.sessionId === actor.sessionId && m.runId === runId);
   const t = m && s.tasks.find(t => t.id === m.taskId);
-  if (!m || !t || !t.slotHeld || !conversationEligible(s, t) || recoveryBlocks(t)) throw new Error("Caller is not an actively leased current member/conversation");
+  if (!m || !t || !t.slotHeld || !conversationEligible(s, t, allowPausedReceipt) || recoveryBlocks(t)) throw new Error("Caller is not an actively leased current member/conversation");
   return m;
 }
 function liveRun(s: TeamflowSnapshot, id: string) {
@@ -89,7 +89,7 @@ export function collaborate(s: TeamflowSnapshot, c: TeamflowCommand, actor: Acto
     }
     case "member.finish": {
       const t = s.tasks.find(t => t.id === c.payload.taskId);
-      if (!t?.child || t.status !== "running" || t.child.completedAt || memberActor(s, actor, t.runId).id !== t.memberId) throw new Error("Only active child owner may finish once; completion history is immutable");
+      if (!t?.child || t.status !== "running" || t.child.completedAt || memberActor(s, actor, t.runId, true).id !== t.memberId) throw new Error("Only active child owner may finish once; completion history is immutable");
       // Completion is a factual history, applicability is a separate field.
       const a = associationFor(s, t.runId, t.memberId, t.child.parentMemberId, c.payload, true);
       if (a.topicId) t.child.topicId = a.topicId; // preserve the explicit result association for later relays
@@ -107,7 +107,7 @@ export function collaborate(s: TeamflowSnapshot, c: TeamflowCommand, actor: Acto
     }
     case "message.ack": {
       const m = s.messages.find(m => m.id === c.payload.messageId);
-      if (!m || !["delivered", "acknowledged"].includes(m.status) || memberActor(s, actor, m.runId).id !== m.to || !["observed_inbox", "observed_context"].includes(m.admission ?? "")) throw new Error("Only actual recipient may acknowledge a native-observed, non-cancelled delivered message");
+      if (!m || !["delivered", "acknowledged"].includes(m.status) || memberActor(s, actor, m.runId, true).id !== m.to || !["observed_inbox", "observed_context"].includes(m.admission ?? "")) throw new Error("Only actual recipient may acknowledge a native-observed, non-cancelled delivered message");
       m.status = "acknowledged"; m.acknowledgedAt = now(); break;
     }
     case "topic.open": {

@@ -26,7 +26,7 @@ export const AgentCommandSchema = z.discriminatedUnion("type", [
   AgentCommands.draftSave, AgentCommands.patchPropose,
 ]);
 export const CommandSchema = z.discriminatedUnion("type", [
-  command("run.start", { runId: id, versionId: id, label: id, brief: id.max(32000).optional(), config: z.object({ activeSlots: z.number().int().min(1).max(16).optional(), childDepth: z.number().int().min(0).max(2).optional(), reworkAttempts: z.number().int().min(0).max(10).optional() }).strict().optional() }),
+  command("run.start", { runId: id, versionId: id, label: id, brief: id.max(32000).optional(), mainSessionId: id.optional(), config: z.object({ activeSlots: z.number().int().min(1).max(16).optional(), childDepth: z.number().int().min(0).max(2).optional(), reworkAttempts: z.number().int().min(0).max(10).optional() }).strict().optional() }),
   command("run.pause", { runId: id }), command("run.resume", { runId: id }), command("run.cancel", { runId: id }),
   ...AgentCommandSchema.options,
   command("gate.approve", binding), command("gate.reject", { ...binding, reason: id }),

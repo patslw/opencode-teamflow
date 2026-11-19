@@ -12,13 +12,14 @@ import { patchBlocks, settlePatches } from "./patches.js";
 export { writerKey } from "./dispatch.js";
 // Shared by deferred selection and the final atomic native authorization.
 function initialRunEligible(run: Run, task: Task) {
-  return run.status === "running" || run.status === "waiting" && !!task.child && !task.child.staleBy;
+  return run.entry?.state !== "pending" && (run.status === "running" || run.status === "waiting" && !!task.child && !task.child.staleBy);
 }
 export class Scheduler {
   readonly owner = uid();
   private busy = false;
   private stopped = false;
   private fenced = false;
+  private readonly entryRetryAt = new Map<string, number>();
   constructor(private store: TeamflowStore, private adapter: OpenCodeAdapter, private scope: BackendScope, private changed: (s: TeamflowSnapshot) => Promise<void>) {}
   stop() { this.stopped = true; }
   private hasLeadership() { return !this.stopped && !this.fenced && this.store.owns(leaderKey(this.scope), this.owner); }
@@ -29,6 +30,25 @@ export class Scheduler {
     });
   }
   private async announce(s: TeamflowSnapshot) { try { await this.changed(s); } catch { /* committed state wins */ } }
+  private async prepareRunEntry() {
+    const run = this.store.read(this.scope).runs.find(r => r.entry?.state === "pending" &&
+      !["cancelled", "failed"].includes(r.status) && (this.entryRetryAt.get(r.id) ?? 0) <= Date.now());
+    if (!run?.entry || !this.hasLeadership()) return;
+    const entry = run.entry;
+    let error: string | undefined;
+    try { await this.adapter.ensureRunEntry(this.scope, { ...run, entry }); }
+    catch (cause) { error = cause instanceof Error ? cause.message || cause.name : String(cause); }
+    if (error) this.entryRetryAt.set(run.id, Date.now() + 10000);
+    else this.entryRetryAt.delete(run.id);
+    if (!this.hasLeadership() || (error && error === entry.error)) return;
+    await this.announce(this.commit(s => {
+      const current = s.runs.find(r => r.id === run.id)?.entry;
+      if (current?.sessionId !== entry.sessionId || current.state !== "pending") throw new Error("Main-session reservation changed");
+      if (error) current.error = error;
+      else { current.state = "ready"; delete current.error; }
+      audit(s, error ? "run.entry_waiting" : "run.entry_ready", { kind: "system" }, JSON.stringify({ runId: run.id, sessionId: entry.sessionId, error }));
+    }));
+  }
   private async waitForReceipt(taskId: string, receipt: Promise<void>) {
     // Do not let a lost/cancelled native request monopolize this scheduler loop.
     // Its receipt handler stays attached and records the actual late outcome, but
@@ -115,6 +135,7 @@ export class Scheduler {
       }, 3000);
       const execution = { store: this.store, adapter: this.adapter, scope: this.scope, owner: this.owner,
         leader: () => this.hasLeadership(), announce: (s: TeamflowSnapshot) => this.announce(s) };
+      await this.prepareRunEntry();
       await pumpCollaboration(execution);
       await reconcileExecutions(execution);
       // Claim intent inside the same SQLite write transaction as slot and writer lease.
@@ -154,7 +175,7 @@ export class Scheduler {
             (!t.writes || this.store.owns(writerKey(this.scope), t.id));
         });
         if (deferred) { claimed = structuredClone(deferred); return structuredClone(s); }
-        for (const run of s.runs.filter(r => ["running", "waiting"].includes(r.status))) {
+        for (const run of s.runs.filter(r => r.entry?.state !== "pending" && ["running", "waiting"].includes(r.status))) {
           if (s.tasks.filter(t => t.runId === run.id && t.slotHeld).length >= run.config.activeSlots) continue;
           const child = s.tasks.find(t => t.runId === run.id && t.child && !t.slotHeld && t.status === "intent" && t.owner === "collaboration:queued");
           if (child) {

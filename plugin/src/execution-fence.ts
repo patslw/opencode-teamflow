@@ -20,10 +20,10 @@ export function unresolvedMessages(s: TeamflowSnapshot, t: Task) {
   return s.messages.some(m => m.to === t.memberId && m.runId === t.runId &&
     (m.request ? ["in_flight", "unknown"].includes(m.request.state) : m.admission === "pending" || m.status === "uncertain"));
 }
-export function conversationEligible(s: TeamflowSnapshot, t: Task) {
+export function conversationEligible(s: TeamflowSnapshot, t: Task, allowPausedReceipt = false) {
   const run = s.runs.find(r => r.id === t.runId);
   const a = s.attempts.find(a => a.id === t.attemptId);
-  if (!run || ["cancelled", "failed", "paused"].includes(run.status) || !a || a.supersededBy ||
+  if (!run || ["cancelled", "failed"].includes(run.status) || (run.status === "paused" && !allowPausedReceipt) || !a || a.supersededBy ||
     !["running", "passed"].includes(a.status) || t.child?.staleBy ||
     !["running", "submitted"].includes(t.status)) return false;
   const latest = s.attempts.filter(x => x.runId === t.runId && x.nodeId === a.nodeId).sort((a, b) => b.round - a.round)[0];

@@ -30,6 +30,7 @@ import type {
   WorkflowRole,
   StageAttempt,
   Member,
+  Run,
   Task,
 } from "../../../packages/protocol/src/index";
 import {
@@ -573,6 +574,7 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
                   </span>
                 )}
               </div>
+              {run && snapshot && <RunEntry key={run.id} run={run} snapshot={snapshot} connection={connection.current} openMember={setMemberId} />}
               {snapshot && !run && <DraftView active={active} snapshot={snapshot} version={published} localVersion={draft}
                 pending={pending || !!unresolved} mutate={mutate} connection={connection.current}
                 touched={() => { editorEpoch.current++; setDraftPanelInput(true); }}
@@ -823,7 +825,7 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
                         <>
                           <h2>启动工作流</h2>
                           <p className="muted">
-                            仅启动已发布版本。不会使用上方本地草稿。实际成员由后端派工。
+                            仅启动已发布版本。后端为本实例保留一条原生团队主会话；成员和子成员从实例进入私聊，不占原生默认列表。
                           </p>
                           <Field
                             title="实例名称"
@@ -969,6 +971,39 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
       </footer>
     </div>
   );
+}
+
+function RunEntry({ run, snapshot, connection, openMember }: {
+  run: Run; snapshot: TeamflowSnapshot; connection?: TeamflowConnection; openMember(id: string): void;
+}) {
+  const [history, setHistory] = useState<unknown[]>();
+  const [error, setError] = useState("");
+  const entry = run.entry;
+  const members = snapshot.members.filter(m => m.runId === run.id);
+  return <section className="panel" aria-label="团队主入口">
+    <h2>团队主入口</h2>
+    <p>{run.brief}</p>
+    {entry?.state === "ready" ? <>
+      <p>{entry.source === "existing" ? "已绑定发起流程的原生聊天" : "原生 Sessions 中的 Teamflow 主会话"} · <code>{entry.sessionId}</code></p>
+      <details>
+        <summary>查看原生主会话</summary>
+        <p>在同一项目的原生 TUI 中，使用 <code>/teamflow</code> → 查看实例与成员 → 打开原生团队主会话。后台派工不会自动唤醒主会话。</p>
+        <button disabled={!connection} onClick={async () => {
+          try { setHistory(await connection!.sessionMessages(entry.sessionId)); setError(""); }
+          catch (cause) { setError(`无法读取原会话（不会重建）：${String(cause)}`); }
+        }}>读取原生主会话历史</button>
+        {error && <p role="alert">{error}</p>}
+        {!error && history?.map((message, i) => <NativeMessage key={i} value={message} />)}
+        {!error && history?.length === 0 && <p>尚无原生聊天消息。</p>}
+      </details>
+    </> : entry ? <p>主会话尚未就绪；后端只核对预留 ID，不会另建入口。{entry.error ? ` ${entry.error}` : ""}</p>
+      : <p>历史实例没有原生主会话绑定；不自动迁移或创建。</p>}
+    <h3>成员私聊</h3>
+    {members.length ? members.map(m => <button key={m.id} onClick={() => openMember(m.id)}>
+      {m.parentMemberId ? "子成员 · " : ""}{m.role} · {m.id}
+    </button>) : <p className="muted">尚无可进入的成员会话。</p>}
+    <p className="muted">议题和成员回执见下方「协作与纠偏」。暂停时可查阅历史，私聊意图等待恢复后投递。</p>
+  </section>;
 }
 
 function NodeEditor({
@@ -1705,7 +1740,9 @@ function SessionView({
         <h2>向此成员发送指示</h2>
         <p>
           {canSend
-             ? "同一原生会话继续；调度器获取槽位/写租约后恢复，不重交旧工作/通过结论；原专业成员可对仍有效的同一交付登记迟到负面结论。"
+             ? snapshot.runs.find(r => r.id === member.runId)?.status === "paused"
+               ? "调度已暂停：此处只登记消息意图，恢复后才可投递到原会话。"
+               : "同一原生会话继续；调度器获取槽位/写租约后恢复，不重交旧工作/通过结论；原专业成员可对仍有效的同一交付登记迟到负面结论。"
              : "已取消 / 被替换 / 不确定 / 过期会话只读，不复活旧工作。"}
         </p>
         <Field

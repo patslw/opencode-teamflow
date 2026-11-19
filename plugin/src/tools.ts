@@ -34,7 +34,7 @@ export async function registerTools(ctx: Plugin.Context, scope: BackendScope, se
   await ctx.tool.transform(editor => {
     registerTeamflowTools({ scope, changed, register: definition => editor.add(definition) }, service);
     editor.add({
-      name: "teamflow_context", description: "Read registered run peers, your inbox and tracking, bounded discussion and correction status. No coordinator transcript or other sessions' text.",
+      name: "teamflow_context", description: "Read linked Teamflow run status in a main chat, or your registered member inbox, bounded discussions and corrections. No other sessions' transcripts.",
       input: z.object({}).strict(),
       execute: async (_input, context) => {
         const s = await service.snapshot(scope), m = s.members.find(m => m.sessionId === context.sessionID);
@@ -44,9 +44,23 @@ export async function registerTools(ctx: Plugin.Context, scope: BackendScope, se
           patches: s.patches.filter(p => p.draftId === draft.id),
           instruction: "Only draft.save for this exact draft ID/revision and patch.propose for its content. No user publish/apply/Gate rights. Re-read and compare on conflict. No file writes/shell/delegation.",
         }) };
-        if (!m) throw new Error("Session is not a registered Teamflow member");
+        if (!m) {
+          const runs = s.runs.filter(r => r.entry?.sessionId === context.sessionID && r.entry.state === "ready");
+          const run = runs.findLast(r => ["running", "waiting", "paused"].includes(r.status)) ?? runs.at(-1);
+          if (!run) throw new Error("Session is not registered in Teamflow");
+          return { content: JSON.stringify({
+            run, attempts: s.attempts.filter(a => a.runId === run.id && !a.supersededBy),
+            members: s.members.filter(m => m.runId === run.id).map(m => ({ id: m.id, role: m.role, parentMemberId: m.parentMemberId })),
+            topics: s.topics.filter(t => t.runId === run.id).map(t => ({ id: t.id, question: t.question, status: t.status })),
+            instruction: "Read-only Teamflow main chat. The user opens /teamflow or the web run to manage stages, members, private messages, topics or approvals. Never use a native subagent to do Teamflow work.",
+          }) };
+        }
         const task = s.tasks.find(t => t.id === m.taskId);
-        if (!task?.slotHeld || !conversationEligible(s, task) || recoveryBlocks(task)) return { content: JSON.stringify({ self: m, taskId: task?.id, status: task?.status, instruction: "No current scheduler execution authority; context bodies hidden. Ask user for controlled continuation/recovery." }) };
+        if (!task?.slotHeld || !conversationEligible(s, task, true) || recoveryBlocks(task)) return { content: JSON.stringify({ self: m, taskId: task?.id, status: task?.status, instruction: "No current scheduler execution authority; context bodies hidden. Ask user for controlled continuation/recovery." }) };
+        if (s.runs.find(run => run.id === m.runId)?.status === "paused") return { content: JSON.stringify({
+          self: m, taskId: task.id, status: task.status,
+          instruction: "Teamflow is paused. Finish the already admitted turn only. Submit its actual result with the original task.submit, review.submit or member.finish as instructed, or acknowledge a message already delivered to this turn. No new work, spawn, discussion or Gate action. This receipt does not start another turn.",
+        }) };
         return { content: JSON.stringify({
           revision: s.revision, self: m, task: s.tasks.find(t => t.id === m.taskId),
           peers: s.members.filter(p => p.runId === m.runId),

@@ -38,7 +38,8 @@ export async function backendRegistry(file: string) {
       const readMessages = async (sessionId: string) => {
         // Check membership BEFORE native access, including old cached plugins.
         const snapshot = await rpc.snapshot(scope, options);
-        if (!snapshot.members.some(m => m.sessionId === sessionId) && !snapshot.drafts.some(d => d.designer?.sessionId === sessionId))
+        if (!snapshot.members.some(m => m.sessionId === sessionId) && !snapshot.drafts.some(d => d.designer?.sessionId === sessionId) &&
+          !snapshot.runs.some(r => r.entry?.state === "ready" && r.entry.sessionId === sessionId))
           throw new Error(`Session ${sessionId} is not registered in this scope`);
         try {
           await client.session.get({ sessionID: sessionId });

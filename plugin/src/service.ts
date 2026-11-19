@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { CommandSchema, defaults, MutationEnvelopeSchema, type ActorContext, type BackendScope, type MutationEnvelope, type MutationResult, type TeamflowService } from "../../packages/protocol/src/index.js";
-import { advance, audit, executeSubmission, now, startAttempts } from "./engine.js";
+import { CommandSchema, defaults, MutationEnvelopeSchema, type ActorContext, type BackendScope, type MutationEnvelope, type MutationResult, type Run, type TeamflowService } from "../../packages/protocol/src/index.js";
+import { advance, audit, executeSubmission, now, startAttempts, uid } from "./engine.js";
 import { validateVersion } from "./model.js";
 import type { TeamflowStore } from "./store.js";
 import type { OpenCodeAdapter } from "./opencode-adapter.js";
@@ -17,7 +17,8 @@ export function createTeamflowService({ store, adapter }: { store: TeamflowStore
     async snapshot(scope) { return store.read(scope); },
     async assertSession(scope, sessionId) {
       const s = store.read(scope);
-      if (!s.members.some(m => m.sessionId === sessionId) && !s.drafts.some(d => d.designer?.sessionId === sessionId)) throw new Error("Session is not registered in this scope");
+      if (!s.members.some(m => m.sessionId === sessionId) && !s.drafts.some(d => d.designer?.sessionId === sessionId) &&
+        !s.runs.some(r => r.entry?.sessionId === sessionId && r.entry.state === "ready")) throw new Error("Session is not registered in this scope");
     },
     async apply(input: MutationEnvelope, actor: ActorContext): Promise<MutationResult> {
       const envelope = MutationEnvelopeSchema.parse(input);
@@ -25,6 +26,12 @@ export function createTeamflowService({ store, adapter }: { store: TeamflowStore
       if (envelope.command.type === "draft.design" || envelope.command.type === "draft.discuss") return design({ store, adapter, envelope, actor, fingerprint });
       if (envelope.command.type === "dispatch.reconcile") return reconcileDispatch({ store, adapter, envelope, payload: envelope.command.payload, actor, fingerprint });
       if (envelope.command.type === "message.reconcile") return reconcileMessage({ store, adapter, envelope, payload: envelope.command.payload, actor, fingerprint });
+      if (envelope.command.type === "run.start" && envelope.command.payload.mainSessionId) {
+        if (actor.kind !== "user") throw new Error("Only user may start a run");
+        const prior = existingRequestResult(store, store.read(envelope.scope), envelope.requestId, fingerprint);
+        if (prior) return prior;
+        await adapter.assertMainSession(envelope.scope, envelope.command.payload.mainSessionId);
+      }
       if (envelope.command.type === "draft.publish") {
         const draftId = envelope.command.payload.draftId;
         const snapshot = store.read(envelope.scope);
@@ -49,10 +56,16 @@ export function createTeamflowService({ store, adapter }: { store: TeamflowStore
             if (actor.kind !== "user") throw new Error("Only user may start a run");
             const p = c.payload;
             if (s.runs.some(r => r.id === p.runId)) throw new Error("Run already exists");
+            if (p.mainSessionId && (s.members.some(m => m.sessionId === p.mainSessionId) || s.drafts.some(d => d.designer?.sessionId === p.mainSessionId) ||
+              s.runs.some(r => r.entry?.sessionId === p.mainSessionId && !["completed", "cancelled", "failed"].includes(r.status)))) throw new Error("The session is already a Teamflow private session or is bound to a live run");
             const version = s.versions.find(v => v.id === p.versionId);
             if (!version) throw new Error("Unknown published version");
             validateVersion(version); // Legacy catalog entries must obey supported semantics too.
-            const run = { id: p.runId, versionId: p.versionId, label: p.label, brief: p.brief ?? p.label, status: "running" as const, config: { activeSlots: p.config?.activeSlots ?? defaults.activeSlots, childDepth: p.config?.childDepth ?? defaults.childDepth, reworkAttempts: p.config?.reworkAttempts ?? defaults.reworkAttempts }, createdAt: now() };
+            const run: Run = { id: p.runId, versionId: p.versionId, label: p.label, brief: p.brief ?? p.label, status: "running",
+              entry: p.mainSessionId
+                ? { sessionId: p.mainSessionId, source: "existing", state: "ready" }
+                : { sessionId: `ses_${uid().replaceAll("-", "")}`, source: "teamflow", state: "pending" },
+              config: { activeSlots: p.config?.activeSlots ?? defaults.activeSlots, childDepth: p.config?.childDepth ?? defaults.childDepth, reworkAttempts: p.config?.reworkAttempts ?? defaults.reworkAttempts }, createdAt: now() };
             s.runs.push(run); startAttempts(s, run); break;
           }
           case "run.pause": case "run.resume": case "run.cancel": {

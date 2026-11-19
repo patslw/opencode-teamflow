@@ -3,7 +3,7 @@ import { OpenCode, type OpenCodeClient } from "@opencode/client";
 import { Service } from "@opencode/client/service";
 import { readFile } from "node:fs/promises";
 import { z } from "zod";
-import type { BackendScope, MemberDelivery, MemberLaunch, MemberSession, Task, TeamflowMessage } from "../../packages/protocol/src/index.js";
+import type { BackendScope, MemberDelivery, MemberLaunch, MemberSession, Run, Task, TeamflowMessage } from "../../packages/protocol/src/index.js";
 
 export class DispatchNotSentError extends Error {}
 export interface DispatchInspection {
@@ -12,39 +12,75 @@ export interface DispatchInspection {
 }
 
 export class OpenCodeAdapter {
-  private inboxClient?: Promise<OpenCodeClient>;
+  private client?: Promise<OpenCodeClient>;
   constructor(private readonly ctx: Plugin.Context, private readonly parentSession: (memberId: string) => string | undefined) {}
-  private nativeInbox() {
-    // Plugin 2.3.0 SessionDomain omits inbox. Use the official authenticated client,
-    // discover-only, and prove it is this very backend process before any access.
-    if (this.inboxClient) return this.inboxClient;
+  private nativeClient() {
+    // Use the official authenticated HTTP API for inbox and archiving. Prove
+    // discovery resolved this exact backend process before any access.
+    if (this.client) return this.client;
     const initialization = (async () => {
       const file = this.ctx.options.nativeConnectionFile;
       const endpoint = typeof file === "string"
         ? z.object({ url: z.string().url(), auth: z.object({ type: z.literal("basic"), username: z.string(), password: z.string().min(1) }).strict() }).strict().parse(JSON.parse(await readFile(file, "utf8")))
         : await Service.discover();
-      if (!endpoint) throw new Error("Native inbox unavailable: no registered backend");
+      if (!endpoint) throw new Error("Native session API unavailable: no registered backend");
       const client = OpenCode.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) });
-      if ((await client.server.info()).pid !== process.pid) throw new Error("Native inbox endpoint is not this backend process");
+      if ((await client.server.info()).pid !== process.pid) throw new Error("Native session API endpoint is not this backend process");
       return client;
     })();
-    this.inboxClient = initialization;
+    this.client = initialization;
     // Clear only this failed initialization, never a newer cached instance.
-    void initialization.catch(() => { if (this.inboxClient === initialization) this.inboxClient = undefined; });
+    void initialization.catch(() => { if (this.client === initialization) this.client = undefined; });
     return initialization;
+  }
+
+  async assertMainSession(scope: BackendScope, sessionId: string) {
+    const session = await this.ctx.session.get({ sessionID: sessionId });
+    if (session.location.directory !== scope.projectDirectory || session.parentID || session.time.archived || session.metadata?.teamflow) {
+      throw new Error("Use an active top-level user session in the current project as the Teamflow main session");
+    }
+  }
+
+  async ensureRunEntry(scope: BackendScope, run: Run & { entry: NonNullable<Run["entry"]> }) {
+    const id = run.entry.sessionId;
+    // Use the authenticated client for a typed NotFound. No new ID is ever
+    // chosen on failure, replay, or scheduler takeover.
+    const client = await this.nativeClient();
+    const metadata = { teamflow: { kind: "run-entry", runId: run.id } };
+    let session;
+    try { session = await client.session.get({ sessionID: id }); }
+    catch (error) {
+      if (!error || typeof error !== "object" || !("_tag" in error) || error._tag !== "SessionNotFoundError") throw error;
+      session = await this.ctx.session.create({
+        id, title: `Teamflow · ${run.label.replace(/\s+/g, " ").trim().slice(0, 100)} · 团队入口`,
+        location: { directory: scope.projectDirectory }, metadata,
+        permissions: [{ action: "subagent", resource: "*", effect: "deny" }],
+      });
+    }
+    const tag = session.metadata?.teamflow as Record<string, unknown> | undefined;
+    if (session.id !== id || session.parentID || session.location.directory !== scope.projectDirectory || tag?.kind !== "run-entry" || tag.runId !== run.id) {
+      throw new Error("Native Teamflow main-session identity mismatch");
+    }
+    await this.ctx.session.instructions.entry.put({
+      sessionID: id, key: "teamflow.entry",
+      value: `This is the Teamflow main chat for run ${run.id}. User request:\n${run.brief}\n\nUse teamflow_context to read its real status. For running, approving, or chatting with members, direct the user to /teamflow (TUI) or the Teamflow web run. Do not impersonate members or launch native subagents for this run.`,
+    });
   }
 
   async createMember(launch: MemberLaunch): Promise<MemberSession> {
     const parentID = launch.parentMemberId ? this.parentSession(launch.parentMemberId) : undefined;
     if (launch.parentMemberId && !parentID) throw new Error("Unknown parent member");
     let model: MemberLaunch["model"];
+    let client: OpenCodeClient;
     try {
+      client = await this.nativeClient();
       await this.ctx.agent.get({ agentID: launch.role });
       const selected = launch.model ?? (await this.ctx.model.default()).data;
       if (!selected) throw new Error("No default model available");
       model = { providerID: selected.providerID, id: selected.id };
       if (launch.model && !(await this.ctx.model.list()).data.some(m => m.enabled && m.providerID === selected.providerID && m.id === selected.id)) throw new Error("Configured role model is not available on this backend");
     } catch (error) { throw new DispatchNotSentError(error instanceof Error ? error.message || error.name : "Member preflight failed before session.create"); }
+    const identity = { kind: "private", memberId: launch.memberId, runId: launch.runId, ...(launch.parentMemberId ? { parentMemberId: launch.parentMemberId } : {}), ...(launch.taskId ? { taskId: launch.taskId } : {}), ...(launch.dispatchId ? { dispatchId: launch.dispatchId } : {}) };
     const session = await this.ctx.session.create({
       ...(launch.sessionId ? { id: launch.sessionId } : {}),
       title: `Teamflow ${launch.memberId}: ${launch.brief.slice(0, 80)}`,
@@ -54,13 +90,22 @@ export class OpenCodeAdapter {
       // parent on completion without a scheduler admission hook in SDK 2.3.0.
       // Never enable that unmetered execution path.
       location: { directory: launch.scope.projectDirectory },
-      metadata: { teamflow: { memberId: launch.memberId, runId: launch.runId, ...(launch.parentMemberId ? { parentMemberId: launch.parentMemberId } : {}), ...(launch.taskId ? { taskId: launch.taskId } : {}), ...(launch.dispatchId ? { dispatchId: launch.dispatchId } : {}) } },
+      metadata: { teamflow: identity },
       permissions: [
         { action: "subagent", resource: "*", effect: "deny" },
         ...(launch.writes === false ? [{ action: "edit", resource: "*", effect: "deny" as const }] : []),
         ...(launch.parentMemberId ? [{ action: "shell", resource: "*", effect: "deny" as const }] : []),
       ],
     });
+    // Only the positively identified result of this exact new creation may be
+    // archived here. No list scans, no retroactive changes to old sessions.
+    const tag = session.metadata?.teamflow as Record<string, unknown> | undefined;
+    if ((launch.sessionId && session.id !== launch.sessionId) || session.parentID || session.location.directory !== launch.scope.projectDirectory ||
+      !Object.entries(identity).every(([key, value]) => tag?.[key] === value)) throw new Error("New private Teamflow session identity mismatch; not archived");
+    // 2.3.2's plugin SessionDomain.update accepts the field in its type, but
+    // does not archive at runtime. The native HTTP PATCH does; verify by GET.
+    await client.session.update({ sessionID: session.id, archived: true });
+    if (!(await client.session.get({ sessionID: session.id })).time.archived) throw new Error("New private Teamflow session is not archived; no dispatch or design prompt admitted");
     // The brief is an instruction entry, not a fabricated conversation or an implicit agent start.
     // Preserve even a partially configured real session for explicit reconciliation.
     await this.ctx.session.instructions.entry.put({ sessionID: session.id, key: "teamflow.task", value: launch.brief });
@@ -95,7 +140,7 @@ export class OpenCodeAdapter {
     }
   }
   async observeMessage(sessionId: string, messageId: string) {
-    const client = await this.nativeInbox();
+    const client = await this.nativeClient();
     const inbox = await client.session.inbox.list({ sessionID: sessionId });
     if (inbox.some(m => m.id === messageId)) return "observed_inbox" as const;
     if ((await this.listMessages(sessionId)).some(m => m.id === messageId)) return "observed_context" as const;
@@ -104,7 +149,7 @@ export class OpenCodeAdapter {
   async inspectCollaboration(scope: BackendScope, task: Task, message: TeamflowMessage) {
     const native = await this.inspectDispatch(scope, task);
     if (!native.exists) return { ...native, message: "absent" as const };
-    const client = await this.nativeInbox();
+    const client = await this.nativeClient();
     const queued = (await client.session.inbox.list({ sessionID: native.sessionId })).find(x => x.id === message.id);
     const delivered = (await this.listMessages(native.sessionId)).find(x => x.id === message.id);
     if (queued && queued.type !== "synthetic" || delivered && delivered.type !== "synthetic") throw new Error("Collaboration ID has a different native type");
@@ -114,7 +159,7 @@ export class OpenCodeAdapter {
       evidence: [...native.evidence, `collaboration ${message.id}: ${queued ? "queued" : delivered ? "delivered" : "absent"}; ${text && message.request ? "exact durable content matched" : text ? "legacy ID observed (no canonical request text stored)" : "no matching native content; absence is not no-send proof"}`] };
   }
   async cancelQueuedCollaboration(sessionId: string, messageIds: string[]) {
-    const client = await this.nativeInbox();
+    const client = await this.nativeClient();
     const cancelled: string[] = [];
     for (const item of await client.session.inbox.list({ sessionID: sessionId })) {
       if (item.type !== "synthetic" || !messageIds.includes(item.id)) continue;
@@ -125,7 +170,7 @@ export class OpenCodeAdapter {
   }
   async inspectDispatch(scope: BackendScope, task: Task, candidate?: string): Promise<DispatchInspection> {
     let sessionId = candidate ?? task.sessionId ?? task.dispatch?.sessionId;
-    const client = await this.nativeInbox();
+    const client = await this.nativeClient();
     // Legacy unknown creations lack a planned ID. A user-supplied nonexistent ID
     // is not evidence of absence: exhaustively discover by native member metadata.
     if (!task.dispatch && !task.sessionId) {
@@ -188,12 +233,15 @@ export class OpenCodeAdapter {
     };
   }
   async prepareBound(sessionId: string, brief: string) {
+    const session = await (await this.nativeClient()).session.get({ sessionID: sessionId });
+    const tag = session.metadata?.teamflow as Record<string, unknown> | undefined;
+    if (tag?.kind === "private" && !session.time.archived) throw new Error("Private Teamflow session was not archived; no recovery dispatch admitted");
     await this.ctx.session.instructions.entry.put({ sessionID: sessionId, key: "teamflow.task", value: brief });
   }
   async stopDispatch(scope: BackendScope, task: Task, candidate?: string) {
     const before = await this.inspectDispatch(scope, task, candidate);
     if (!before.exists) return before;
-    if (before.message === "queued") await (await this.nativeInbox()).session.inbox.cancel({ sessionID: before.sessionId, inboxID: task.dispatchId });
+    if (before.message === "queued") await (await this.nativeClient()).session.inbox.cancel({ sessionID: before.sessionId, inboxID: task.dispatchId });
     await this.interrupt(before.sessionId);
     return this.inspectDispatch(scope, task, before.sessionId);
   }

@@ -27,6 +27,12 @@ export const RunSchema = z.object({
   id, versionId: id, label: id, brief: id, status: z.enum(["running", "waiting", "paused", "completed", "failed", "cancelled"]),
   config: z.object({ activeSlots: z.number().int().min(1).max(16), childDepth: z.number().int().min(0).max(2), reworkAttempts: z.number().int().min(0).max(10) }).strict(),
   createdAt: id, waitingReason: z.string().optional(),
+  entry: z.object({
+    sessionId: id,
+    source: z.enum(["existing", "teamflow"]),
+    state: z.enum(["pending", "ready"]),
+    error: z.string().optional(),
+  }).strict().optional(),
   escalations: z.array(z.object({
     id, reason: id, createdAt: id, versionId: id, affectedAttemptIds: z.array(id),
     legacy: z.boolean().optional(),

@@ -6,6 +6,12 @@ import { MutationRetry, MutationRejectedError } from "./mutation-retry.js";
 const current = (snapshot: TeamflowSnapshot, runId: string, nodeId: string) =>
   snapshot.attempts.filter(a => a.runId === runId && a.nodeId === nodeId).sort((a, b) => b.round - a.round)[0];
 const errorText = (error: unknown) => error instanceof Error ? error.message : typeof error === "string" ? error : JSON.stringify(error);
+function messageText(message: unknown) {
+  if (!message || typeof message !== "object") return;
+  const row = message as { type?: string; text?: string; content?: { type: string; text?: string; name?: string; state?: { status?: string } }[] };
+  const text = row.text ?? row.content?.map(part => part.type === "text" ? part.text : part.type === "tool" ? `[${part.name ?? "工具"} · ${part.state?.status ?? "未知"}]` : "").filter(Boolean).join("\n");
+  return text ? `${row.type ?? "原生消息"}: ${text.length > 1400 ? `${text.slice(0, 1400)}…` : text}` : undefined;
+}
 
 export default Plugin.define({
   id: "teamflow.tui",
@@ -16,6 +22,7 @@ export default Plugin.define({
       if (opening) return;
       opening = true;
       try {
+        const origin = context.ui.router.current();
         const location = context.location ?? context.data.location.default();
         const rpc = context.client.rpc(TeamflowDemo);
         const options = { location };
@@ -70,25 +77,86 @@ export default Plugin.define({
           }
           return true;
         };
-        const navigateMember = async (sessionId: string) => {
-          // An unavailable historical session must be reported rather than opened as a new session.
-           try {
-             await context.client.session.get({ sessionID: sessionId });
-             await rpc.sessionMessages({ scope, sessionId }, options);
-           }
-          catch (error) { throw new Error(`无法读取原会话 ${sessionId}：${errorText(error)}`); }
+        const openMain = async (sessionId: string) => {
+          // The CLI may create a missing ID; never route without checking first.
+          await rpc.sessionMessages({ scope, sessionId }, options);
           context.ui.router.navigate({ type: "session", sessionID: sessionId });
+        };
+        const submit = async (snapshot: TeamflowSnapshot, command: TeamflowCommand, input = "") => {
+          try {
+            const result = await mutations.submit(snapshot.revision, command);
+            await alert("Teamflow · 后端响应", result.inProgress
+              ? `未确认提交：${result.inProgress.requestId} · ${result.inProgress.reason}`
+              : `已提交 revision ${result.revision}。消息入队不代表已送达或成员已确认。`);
+          } catch (error) { await submissionError(error, input); }
+        };
+        const showChat = async (sessionId: string) => {
+          while (await resolvePending()) {
+            const snapshot = await read();
+            const member = snapshot.members.find(m => m.sessionId === sessionId);
+            const draft = snapshot.drafts.find(d => d.designer?.sessionId === sessionId);
+            const task = snapshot.tasks.find(t => t.id === member?.taskId);
+            const run = snapshot.runs.find(r => r.id === member?.runId);
+            const canSend = !!(member && !member.legacy && task && ["running", "submitted"].includes(task.status) && !task.child?.staleBy &&
+              run && !["cancelled", "failed"].includes(run.status)) || draft?.designer?.state === "ready";
+            const choice = await context.ui.dialog.select({
+              title: `Teamflow 私聊 · ${member?.role ?? draft?.id ?? sessionId}`,
+              options: [
+                { title: "读取原生会话最近消息", value: "history", description: sessionId },
+                ...(member ? [{ title: "查看 Teamflow 私聊回执", value: "receipts" }] : []),
+                ...(canSend ? [{ title: "发送到原会话（受控入队）", value: "send", description: run?.status === "paused" ? "暂停中，恢复后才会投递" : undefined }] : []),
+              ],
+            });
+            if (!choice) return;
+            if (choice === "history") {
+              try {
+                const messages = await rpc.sessionMessages({ scope, sessionId }, options);
+                await alert("真实原生会话 · 最近消息", messages.map(messageText).filter(Boolean).slice(-8).join("\n\n") || "原生上下文暂无消息");
+              } catch (error) { await alert("无法读取原会话（不会自动重建）", `${sessionId}\n${errorText(error)}`); }
+            } else if (choice === "receipts" && member) {
+              const rows = snapshot.messages.filter(m => m.runId === member.runId && (m.from === member.id || m.to === member.id));
+              await alert("Teamflow 私聊回执", rows.slice(-12).map(m => `${m.from} → ${m.to} · ${m.status}${m.admission ? ` / ${m.admission}` : ""}\n${m.text.slice(0, 320)}\n${m.id}`).join("\n\n") || "尚无已登记私聊");
+            } else if (choice === "send") {
+              const text = await context.ui.dialog.prompt({ title: "发送消息", description: "不替代 Gate 审批；不会直接调用原生聊天模型" });
+              if (!text?.trim()) continue;
+              if (member) {
+                const topics = snapshot.topics.filter(t => t.runId === member.runId && t.status !== "resolved" && t.participants.includes(member.id));
+                const topicId = topics.length ? await context.ui.dialog.select({
+                  title: "关联议题",
+                  options: [{ title: "独立私聊（说明为何无关）", value: "" }, ...topics.map(t => ({ title: t.question, value: t.id }))],
+                }) : "";
+                if (topicId === undefined) continue;
+                const unrelatedReason = !topicId && topics.length ? await context.ui.dialog.prompt({ title: "与现有议题无关的原因" }) : undefined;
+                if (!topicId && topics.length && !unrelatedReason?.trim()) continue;
+                await submit(await read(), { type: "message.send", payload: { runId: member.runId, toMemberId: member.id, text, ...(topicId ? { topicId } : unrelatedReason ? { unrelatedReason } : {}) } }, text);
+              } else if (draft) await submit(await read(), { type: "draft.discuss", payload: { draftId: draft.id, text } }, text);
+            }
+          }
         };
         const chooseMember = async (snapshot: TeamflowSnapshot, runId?: string, attempt?: StageAttempt) => {
           const members = snapshot.members.filter(m => (!runId || m.runId === runId) &&
             (!attempt || snapshot.tasks.some(t => t.attemptId === attempt.id && t.memberId === m.id)));
           if (!members.length) { await alert("成员会话", "此选择没有已登记的成员会话。"); return false; }
           const session = await context.ui.dialog.select({
-            title: "成员原始会话（历史任务可能只读）",
-            options: members.map(m => ({ title: `${m.role} · ${m.id}`, description: `${m.runId} · ${m.sessionId}`, value: m.sessionId })),
+            title: "成员私聊（历史任务可能只读）",
+            options: members.map(m => ({ title: `${m.parentMemberId ? "子成员 · " : ""}${m.role} · ${m.id}`, description: `${m.runId} · ${m.sessionId}`, value: m.sessionId })),
           });
-          if (session) { await navigateMember(session); return true; }
+          if (session) { await showChat(session); return true; }
           return false;
+        };
+        const showTopics = async (snapshot: TeamflowSnapshot, runId: string) => {
+          const topics = snapshot.topics.filter(t => t.runId === runId);
+          if (!topics.length) { await alert("团队议题", "暂无议题。可在 Teamflow 网页发起议题或记录结论。"); return; }
+          const topicId = await context.ui.dialog.select({ title: "团队议题", options: topics.map(t => ({
+            title: t.question, description: `第 ${t.round} 轮 · ${t.status}`, value: t.id,
+          })) });
+          const topic = topics.find(t => t.id === topicId);
+          if (!topic) return;
+          await alert(`议题 · ${topic.status}`, [
+            topic.question, `参与成员：${topic.participants.join(", ")}`,
+            ...topic.responses.map(r => `第 ${r.round ?? 1} 轮 · ${r.memberId}：${r.text}`),
+            topic.conclusion && `结论（不是批准）：${topic.conclusion}`, topic.escalationReason,
+          ].filter(Boolean).join("\n\n"));
         };
         const showNode = async (runId: string, nodeId: string) => {
           // Each return to a node reads fresh authority, including catalog changes at the same revision.
@@ -180,28 +248,46 @@ export default Plugin.define({
         };
         const showRun = async (runId: string) => {
           while (true) {
+            if (!await resolvePending()) return;
             const snapshot = await read();
             const run = snapshot.runs.find(r => r.id === runId);
             const version = snapshot.versions.find(v => v.id === run?.versionId);
             if (!run || !version) throw new Error("流程或版本不存在");
             const nodeId = await context.ui.dialog.select({
-              title: `${run.label} · ${run.status}${run.waitingReason ? ` · ${run.waitingReason}` : ""}`,
-              options: version.graph.nodes.map(node => {
-                const a = current(snapshot, runId, node.id);
-                return { title: `${node.name} · ${a?.status ?? "无状态"} · 第${a?.round ?? "?"}轮`, description: `${node.id} · ${node.kind}`, value: node.id };
-              }),
+              title: `${run.label} · ${run.status}${run.entry?.state === "pending" ? " · 主会话准备中" : ""}${run.waitingReason ? ` · ${run.waitingReason}` : ""}`,
+              options: [
+                { title: "成员私聊", value: ":members" },
+                { title: "团队议题", value: ":topics" },
+                ...(run.entry ? [{ title: run.entry.state === "ready" ? "打开原生团队主会话" : "核对主会话准备状态", value: ":main", description: run.entry.sessionId }] : []),
+                ...(run.status === "paused" ? [{ title: "恢复调度", value: ":resume" }]
+                  : ["running", "waiting"].includes(run.status) ? [{ title: "暂停调度", value: ":pause" }] : []),
+                ...version.graph.nodes.map(node => {
+                  const a = current(snapshot, runId, node.id);
+                  return { title: `${node.name} · ${a?.status ?? "无状态"} · 第${a?.round ?? "?"}轮`, description: `${node.id} · ${node.kind}`, value: node.id };
+                }),
+              ],
             });
             if (!nodeId) return;
-            if (await showNode(runId, nodeId)) return;
+            if (nodeId === ":members") await chooseMember(snapshot, runId);
+            else if (nodeId === ":topics") await showTopics(snapshot, runId);
+            else if (nodeId === ":main" && run.entry) {
+              if (run.entry.state === "ready") { await openMain(run.entry.sessionId); return; }
+              await alert("原生团队主会话尚未就绪", `${run.entry.sessionId}\n${run.entry.error ?? "后端正在核对此 ID，不会另建入口。"}`);
+            }
+            else if (nodeId === ":pause" || nodeId === ":resume") await submit(snapshot, { type: nodeId === ":pause" ? "run.pause" : "run.resume", payload: { runId } });
+            else if (await showNode(runId, nodeId)) continue;
           }
         };
         if (!await resolvePending()) return;
         const snapshot = await read();
+        const linked = origin.type === "session" ? snapshot.runs.filter(r => r.entry?.sessionId === origin.sessionID) : [];
+        const currentRun = linked.findLast(r => ["running", "waiting", "paused"].includes(r.status)) ?? linked.at(-1);
         const action = await context.ui.dialog.select({
           title: `Teamflow · ${scope.backendId} · ${scope.projectDirectory}`,
           options: [
+            ...(currentRun ? [{ title: `此主会话的团队 · ${currentRun.label}`, value: "current" }] : []),
             { title: "查看实例与成员", value: "runs" },
-            { title: "启动流程", value: "start" },
+            { title: "启动流程", value: "start", description: origin.type === "session" ? "绑定当前原生主聊天" : "创建一个 Teamflow 主入口" },
              { title: "打开现有成员会话", value: "members" },
              { title: "打开独立流程设计会话", value: "designers" },
           ],
@@ -212,8 +298,9 @@ export default Plugin.define({
              title: "持久化草稿的真实设计 session（缺失不重建）",
              options: snapshot.drafts.filter(d => d.designer).map(d => ({ title: `${d.id} · rev ${d.revision} · ${d.designer!.state}`, description: d.designer!.sessionId, value: d.designer!.sessionId })),
            });
-           if (sessionId) await navigateMember(sessionId);
-         }
+            if (sessionId) await showChat(sessionId);
+          }
+        else if (action === "current" && currentRun) await showRun(currentRun.id);
         else if (action === "runs") {
           const runId = await context.ui.dialog.select({ title: "流程实例", options: snapshot.runs.map(run => ({ title: `${run.label} · ${run.status}`, description: `${run.id} ${run.waitingReason ?? ""}`, value: run.id })) });
           if (runId) await showRun(runId);
@@ -225,10 +312,12 @@ export default Plugin.define({
           const brief = await context.ui.dialog.prompt({ title: "任务说明（可选）" });
           if (brief === undefined) return;
           const fresh = await read();
-          if (!await context.ui.dialog.confirm({ title: "启动真实流程？", message: `${versionId}\n${label}\n${brief}\n将创建真实成员并可能执行任务。` })) return;
+          if (!await context.ui.dialog.confirm({ title: "启动真实流程？", message: `${versionId}\n${label}\n${brief}\n${origin.type === "session" ? "绑定当前聊天，不另建原生主会话。" : "将创建唯一的原生团队主入口。"}成员在 Teamflow 中私聊。` })) return;
           try {
-            const result = await mutations.submit(fresh.revision, { type: "run.start", payload: { runId: `run-${crypto.randomUUID()}`, versionId, label, ...(brief ? { brief } : {}) } });
+            const runId = `run-${crypto.randomUUID()}`;
+            const result = await mutations.submit(fresh.revision, { type: "run.start", payload: { runId, versionId, label, ...(brief ? { brief } : {}), ...(origin.type === "session" ? { mainSessionId: origin.sessionID } : {}) } });
             await alert("后端响应", result.inProgress ? `操作进行中：${result.inProgress.requestId}；并不表示本次已排队。\n${label}\n${brief}` : `已提交，revision ${result.revision}。请刷新查看实际状态。${result.resyncRequired ? "\n通知未送达，请勿重复启动。" : ""}`);
+            if (!result.inProgress) await showRun(runId);
           } catch (error) { await submissionError(error, `需求摘要：${label}\n任务说明：${brief}`); }
         }
       } catch (error) {
