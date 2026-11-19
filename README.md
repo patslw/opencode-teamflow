@@ -1,10 +1,11 @@
-# Teamflow for OpenCode · 0.1.0-alpha.1
+# Teamflow for OpenCode · 0.1.0-alpha.2
 
 在 OpenCode 里带一个小团队做开发：你和协调者讨论需求，成员在各自的会话工作；在流程图上查看交付、找具体成员私聊，由你决定批准还是返工。**Alpha 是可操作的演示版本**。它复用你已有的 OpenCode 服务和模型认证，不需要再启动一套 OpenCode。
 
 ## 从哪里开始
 
 - **第一次用**：按[安装与第一次验收](docs/guide/quickstart.md)跑一个只读的小任务。看到「等待你验收」就可以停下看结果，不用让 Agent 写任何代码。
+- **多台服务器**：用 `npm run demo:web -- --host <本机局域网IP> --port 3180` 开启 HTTPS 网页；另见[配置远端后端和 SSH 跳板](docs/guide/network.md)。
 - **想试协作和改流程**：见[成员、议题、流程设计与补丁](docs/guide/workflows.md)。
 - **连不上或模型不回复**：见[排错、数据与停止方式](docs/guide/operations.md)。
 
@@ -22,7 +23,7 @@
 
 Alpha 面向单用户 Linux、本机已配置好的 **OpenCode V2**、Node.js 24.22 或 26 和 npm。SDK 依赖锁定为 `2.3.0`；主服务使用过 `2.3.2`。模型由你的 OpenCode 提供，安装 Teamflow 不会获得额外额度或授权。
 
-网页只监听 IPv4 loopback；跨机器访问用 SSH 转发。在你自己的测试项目体验，不要用生产目录试写入节点。本版本没有发布 npm 包；请使用 [GitHub Pre-release](https://github.com/patslw/opencode-teamflow/releases) 中的源码安装。
+网页默认只监听回环地址。可显式绑定局域网地址；非回环入口使用 HTTPS 和独立网页口令。模型、文件及会话仍在所选后端，不随你的浏览器移动。在你自己的测试项目体验。本版本没有发布 npm 包；请使用 [GitHub Pre-release](https://github.com/patslw/opencode-teamflow/releases) 中的源码安装。
 
 ## 当前边界
 

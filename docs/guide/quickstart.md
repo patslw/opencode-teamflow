@@ -14,7 +14,7 @@ npm --version
 请先确认日常 OpenCode 能正常对话，记下一个确实可用的 `provider/model` 以及服务地址。下面命令中的 `49374` 是示例端口，改成你已有服务的端口。不要另起 `opencode serve`。从 Release 解包后进入包含 `package.json` 的目录，或拉取预发布标签：
 
 ```sh
-git clone --branch v0.1.0-alpha.1 --depth 1 https://github.com/patslw/opencode-teamflow.git
+git clone --branch v0.1.0-alpha.2 --depth 1 https://github.com/patslw/opencode-teamflow.git
 cd opencode-teamflow
 npm ci
 npm run typecheck
@@ -39,7 +39,7 @@ npm run demo:example -- "$MODEL"
 npm run demo:web
 ```
 
-保持终端运行，在浏览器打开 **http://127.0.0.1:3180/**（不要改成 `localhost`）。若服务在 SSH 主机上，请在自己电脑另开终端执行 `ssh -N -L 3180:127.0.0.1:3180 <已有的SSH主机别名>`。若 3180 已是本安装的网页，直接打开即可。
+保持终端运行，在浏览器打开 **http://127.0.0.1:3180/**。远程使用可在服务器上指定 `--host` 后从浏览器直接访问 HTTPS，也可保留回环入口、在自己电脑执行 `ssh -N -L 3180:127.0.0.1:3180 <SSH主机别名>`。见[网络配置](network.md)。
 
 ## 3. 从题面到验收
 

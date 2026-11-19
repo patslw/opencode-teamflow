@@ -1,11 +1,14 @@
-import { createServer, type IncomingMessage } from "node:http";
+import { createServer, type IncomingMessage, type RequestListener } from "node:http";
+import { createServer as createTLSServer } from "node:https";
+import { listenConfig } from "./listen.js";
 import { readFile } from "node:fs/promises";
 import { resolve, extname, sep } from "node:path";
 import { backendRegistry } from "./backends.js";
 
 // Local administrator configuration, never supplied by a browser or discovered plugin.
+const listen = await listenConfig();
 const registry = await backendRegistry(resolve(process.env.TEAMFLOW_BACKENDS_FILE ?? ".runtime/backends.json"));
-const address = "http://127.0.0.1:3180";
+const address = listen.origin.origin;
 async function body(request: IncomingMessage) {
   if (!request.headers["content-type"]?.startsWith("application/json")) throw new Error("application/json required");
   let text = "";
@@ -15,16 +18,20 @@ async function body(request: IncomingMessage) {
   }
   return JSON.parse(text);
 }
-const server = createServer(async (request, response) => {
+const handle: RequestListener = async (request, response) => {
   response.setHeader("Cache-Control", "no-store");
   response.setHeader("X-Content-Type-Options", "nosniff");
   response.setHeader("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'");
   // Reject DNS rebinding and cross-origin browser mutations; no generic upstream proxy.
-  if (request.headers.host !== "127.0.0.1:3180" || (request.headers.origin && request.headers.origin !== address)) {
+  if (request.headers.host?.toLowerCase() !== listen.origin.host || (request.headers.origin && request.headers.origin !== address)) {
     response.writeHead(403).end("Forbidden origin/host"); return;
   }
-  const url = new URL(request.url ?? "/", address);
+  if (!listen.authenticated(request.headers.authorization)) {
+    response.writeHead(401, { "WWW-Authenticate": 'Basic realm="Teamflow", charset="UTF-8"' }).end("Teamflow login required"); return;
+  }
   try {
+    const url = new URL(request.url ?? "/", address);
+    if (url.origin !== address) { response.writeHead(403).end("Forbidden origin"); return; }
     if (request.method === "GET" && (url.pathname === "/" || url.pathname.startsWith("/assets/"))) {
       const root = resolve("apps/web/dist");
       const file = resolve(root, url.pathname === "/" ? "index.html" : `.${url.pathname}`);
@@ -87,5 +94,6 @@ const server = createServer(async (request, response) => {
     const rejected = typeof error === "object" && error !== null && "type" in error && error.type === "rejected";
     response.end(JSON.stringify({ error: message, ...(rejected ? { outcome: "rejected" } : {}) }));
   }
-});
-server.listen(3180, "127.0.0.1", () => console.log(`Teamflow Demo ${address}; configured backends=${registry.catalog.backends.length}`));
+};
+const server = listen.tlsOptions ? createTLSServer(listen.tlsOptions, handle) : createServer(handle);
+server.listen(listen.port, listen.host, () => console.log(`Teamflow Demo ${address}; bind=${listen.host}:${listen.port}; configured backends=${registry.catalog.backends.length}`));

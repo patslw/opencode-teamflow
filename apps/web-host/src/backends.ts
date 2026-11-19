@@ -24,7 +24,8 @@ export async function backendRegistry(file: string) {
         : await Service.discover();
       if (!endpoint) throw new Error("No healthy OpenCode service registered");
       assertDiscoveredEndpoint(backend.endpoint, endpoint.url);
-      const client = OpenCode.make({ baseUrl: backend.endpoint, headers: Service.headers(endpoint) });
+      const client = OpenCode.make({ baseUrl: backend.endpoint, headers: Service.headers(endpoint),
+        fetch: (input, init) => fetch(input, { ...init, redirect: "error" }) });
       const rpc = client.rpc(TeamflowDemo);
       const options = { location: { directory: scope.projectDirectory } };
       // Access boots location plugins asynchronously. Cancellation never authorizes a mutation.

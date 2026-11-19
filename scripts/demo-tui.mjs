@@ -5,6 +5,7 @@ import { Service } from "@opencode/client/service";
 import { OpenCode } from "@opencode/client";
 import { TeamflowDemo } from "../dist/packages/protocol/src/rpc.js";
 import { homedir } from "node:os";
+import { backendOrigin } from "../dist/apps/web-host/src/backend-config.js";
 
 const config = JSON.parse(await readFile(resolve(process.env.TEAMFLOW_BACKENDS_FILE ?? ".runtime/backends.json"), "utf8"));
 const [id = config.selectedBackend, project] = process.argv.slice(2);
@@ -16,8 +17,8 @@ if (!projects.includes(directory)) throw new Error("Project not configured for t
 const endpoint = backend.connectionFile
   ? JSON.parse(await readFile(resolve(backend.connectionFile), "utf8"))
   : await Service.discover();
-const normalized = value => new URL(value).origin.replace("://0.0.0.0:", "://127.0.0.1:").replace("://localhost:", "://127.0.0.1:");
-if (!endpoint || normalized(endpoint.url) !== normalized(backend.endpoint)) throw new Error("Backend endpoint identity mismatch");
+if (!endpoint || backendOrigin(endpoint.url) !== backendOrigin(backend.endpoint) ||
+  (backend.endpoint.startsWith("https:") && !backend.connectionFile)) throw new Error("Backend endpoint identity mismatch or missing explicit credentials");
 const client = OpenCode.make({ baseUrl: backend.endpoint, headers: Service.headers(endpoint) });
 const rpc = client.rpc(TeamflowDemo);
 let info;

@@ -2,7 +2,7 @@
 
 | 现象 | 先做什么 |
 |---|---|
-| 网页打不开 | 检查 `npm run demo:web` 是否在运行、3180 是否被占用。使用 `http://127.0.0.1:3180/`；远程浏览器需 SSH 转发。 |
+| 网页打不开 | 使用启动日志中的完整 URL。默认本机是 HTTP；非回环是 HTTPS。`403` 时检查域名、端口、协议与 `--public-origin` 是否匹配；浏览器登录框使用独立网页口令。见[网络配置](network.md)。 |
 | 无法连接后端或项目不匹配 | 对照 `opencode service status` 和 `.runtime/backends.json` 中的地址。检查项目的 `opencode.json` 是否指向当前安装的 `plugin` 绝对路径。移动过安装目录时要更新路径。修改映射后仅重启网页宿主。 |
 | `401` 或 `429` | 看**实际运行该成员的服务**记录的 provider/model。401 是认证未通过，429 可能是额度或限流；主页面 HTTP 200 并不证明模型可用。在同一日常 OpenCode 配置里验证模型，不要把 API key 贴进模板、消息或 issue。 |
 | TUI 找不到 Teamflow 菜单 | 从安装根目录用 `npm run demo:tui -- local <允许的绝对项目路径>` 启动；后端装了服务插件，不等于另一个 TUI 客户端已经加载了客户端插件。 |
