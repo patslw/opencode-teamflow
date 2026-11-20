@@ -43,8 +43,8 @@ export function CollaborationPanel({ snapshot: s, runId, mutate, pending }: {
           此通知从未发出，不能用消息终止清除升级。请在原任务 {m.taskId} 的“派工与租约”中重新核对，必要时请求安全终止（dispatch.reconcile inspect/terminate）；如有另一个实际未决消息，按它自己的 messageId 恢复。任务安全恢复后，此通知仍为未送达、需用户关注；不会重发或恢复旧工作。
           {m.taskId && <button disabled={pending} onClick={() => void mutate({ type: "dispatch.reconcile", payload: { taskId: m.taskId!, action: "inspect", reason: "核对未送达纠偏通知对应的原任务安全边界，不终止该通知" } })}>核对原任务派发边界</button>}
         </p>}
-        {s.tasks.find(t => t.id === m.taskId)?.messageRecovery?.messageId === m.id && <pre>{JSON.stringify(s.tasks.find(t => t.id === m.taskId)?.messageRecovery, null, 2)}</pre>}
-        {s.tasks.find(t => t.id === m.taskId)?.messageInspection?.messageId === m.id && <pre>{JSON.stringify(s.tasks.find(t => t.id === m.taskId)?.messageInspection, null, 2)}</pre>}
+        {s.tasks.find(t => t.id === m.taskId)?.messageRecovery?.messageId === m.id && <p>{s.tasks.find(t => t.id === m.taskId)?.messageRecovery?.evidence.join("；")}</p>}
+        {s.tasks.find(t => t.id === m.taskId)?.messageInspection?.messageId === m.id && <p>{s.tasks.find(t => t.id === m.taskId)?.messageInspection?.evidence.join("；")}</p>}
       </article>)}
     </details>
     <details><summary>议题：先独立意见，最多三轮</summary>

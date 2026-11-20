@@ -81,10 +81,17 @@ export const EvidenceSchema = z.object({
   command: id, exitCode: z.number().int(), output: z.string(), version: id,
   source: z.enum(["self_report", "independent_execution"]),
 }).strict();
+export const QuestionSchema = z.object({
+  id, runId: id, memberId: id, attemptId: id, taskId: id,
+  question: id, answer: id.optional(), answerMessageId: id.optional(),
+  status: z.enum(["open", "answered", "superseded"]),
+  createdAt: id, answeredAt: id.optional(), supersededAt: id.optional(),
+}).strict();
 export const DeliverySchema = z.object({
   id, runId: id, attemptId: id, memberId: id, sessionId: id, artifactRevision: id,
   criteriaRevision: id, artifacts: z.array(id).min(1), summary: id, checks: z.array(EvidenceSchema),
   unresolved: z.array(id), createdAt: id, staleBy: id.optional(),
+  confirmedQuestions: z.array(z.object({ id, question: id, answer: id }).strict()).optional(),
 }).strict();
 export const ApprovalSchema = z.object({
   id, runId: id, attemptId: id, targetAttemptId: id, deliveryId: id,
@@ -136,7 +143,7 @@ export const SnapshotSchema = z.object({
   templates: z.array(TemplateSchema), versions: z.array(VersionSchema), runs: z.array(RunSchema),
   members: z.array(MemberSchema), tasks: z.array(TaskSchema), attempts: z.array(AttemptSchema),
   deliveries: z.array(DeliverySchema), approvals: z.array(ApprovalSchema), messages: z.array(MessageSchema),
-  topics: z.array(TopicSchema), patches: z.array(PatchSchema),
+  questions: z.array(QuestionSchema).default([]), topics: z.array(TopicSchema), patches: z.array(PatchSchema),
   drafts: z.array(DraftSchema), corrections: z.array(CorrectionSchema), audit: z.array(AuditSchema),
 }).strict();
 export type TeamflowSnapshot = z.infer<typeof SnapshotSchema>;
@@ -153,6 +160,7 @@ export type Delivery = z.infer<typeof DeliverySchema>;
 export type Approval = z.infer<typeof ApprovalSchema>;
 export type Evidence = z.infer<typeof EvidenceSchema>;
 export type TeamflowMessage = z.infer<typeof MessageSchema>;
+export type TeamflowQuestion = z.infer<typeof QuestionSchema>;
 export type Topic = z.infer<typeof TopicSchema>;
 export type WorkflowPatch = z.infer<typeof PatchSchema>;
 export type WorkflowDraft = z.infer<typeof DraftSchema>;

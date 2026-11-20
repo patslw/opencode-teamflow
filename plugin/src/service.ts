@@ -11,6 +11,8 @@ import { editDraft } from "./drafts.js";
 import { design } from "./designer.js";
 import { patchCommand, settlePatches } from "./patches.js";
 import { activeEscalation, preserveLegacyEscalation } from "./escalation.js";
+import { blockingQuestion, questionCommand } from "./questions.js";
+import { bumpIO } from "./execution-fence.js";
 
 export function createTeamflowService({ store, adapter }: { store: TeamflowStore; adapter: OpenCodeAdapter }): TeamflowService & { assertSession(scope: BackendScope, sessionId: string): Promise<void> } {
   return {
@@ -44,6 +46,17 @@ export function createTeamflowService({ store, adapter }: { store: TeamflowStore
         // session. The final transaction still checks the expected revision.
         await adapter.getSession(d.designer.sessionId);
       }
+      let observedAnswer: string | undefined;
+      if (actor.kind === "agent" && ["question.ask", "task.submit", "review.submit", "member.finish", "member.spawn", "message.ack"].includes(envelope.command.type)) {
+        const s = store.read(envelope.scope);
+        const prior = existingRequestResult(store, s, envelope.requestId, fingerprint);
+        if (prior) return prior;
+        const task = s.tasks.find(t => t.sessionId === actor.sessionId && t.slotHeld);
+        const answer = task && blockingQuestion(s, task)?.answerMessageId;
+        const m = s.messages.find(m => m.id === answer);
+        if (m?.request && ["in_flight", "unknown", "settled"].includes(m.request.state) &&
+          await adapter.hasObservedMessage(actor.sessionId, m.id, m.request)) observedAnswer = m.id;
+      }
       return store.transact(envelope.scope, s => {
         const prior = existingRequestResult(store, s, envelope.requestId, fingerprint);
         if (prior) return prior;
@@ -51,6 +64,16 @@ export function createTeamflowService({ store, adapter }: { store: TeamflowStore
         const c = CommandSchema.parse(envelope.command);
         if (actor.kind === "system") throw new Error("System commands are internal only");
         if (actor.kind === "agent" && s.drafts.some(d => d.designer?.sessionId === actor.sessionId) && !["draft.save", "patch.propose"].includes(c.type)) throw new Error("Independent designer can only edit its assigned draft or propose its patch");
+        if (actor.kind === "agent" && observedAnswer) {
+          const t = s.tasks.find(t => t.sessionId === actor.sessionId && t.slotHeld);
+          const q = t && blockingQuestion(s, t);
+          const m = s.messages.find(m => m.id === observedAnswer && m.taskId === t?.id && m.to === t?.memberId);
+          if (t && q?.answerMessageId === observedAnswer && m?.request && m.status !== "cancelled" && m.request.state !== "not_sent") {
+            m.request.state = "settled"; m.admission = "observed_context";
+            if (m.status !== "acknowledged") m.status = "delivered";
+            bumpIO(t); audit(s, "message.native_observed", { kind: "system" }, m.id);
+          }
+        }
         switch (c.type) {
           case "run.start": {
             if (actor.kind !== "user") throw new Error("Only user may start a run");
@@ -83,7 +106,7 @@ export function createTeamflowService({ store, adapter }: { store: TeamflowStore
               run.status = "running"; delete run.waitingReason;
             } else if (c.type === "run.pause") { run.status = "paused"; if (!activeEscalation(run)) run.waitingReason = "User paused scheduling; active tasks may submit"; }
             else {
-              run.status = "cancelled";
+              run.status = "cancelled"; delete run.waitingReason;
               s.attempts.filter(a => a.runId === run.id && !["passed", "superseded", "needs_revision"].includes(a.status)).forEach(a => a.status = "cancelled");
               s.tasks.filter(t => t.runId === run.id && !["submitted", "superseded"].includes(t.status)).forEach(t => t.status = "cancelled");
               s.approvals.filter(a => a.runId === run.id).forEach(a => a.valid = false);
@@ -92,6 +115,8 @@ export function createTeamflowService({ store, adapter }: { store: TeamflowStore
           }
           case "task.submit": case "review.submit": case "gate.approve": case "gate.reject":
             executeSubmission(s, c, actor); break;
+          case "question.ask": case "question.answer":
+            questionCommand(s, c, actor); break;
           case "template.import": {
             if (actor.kind !== "user") throw new Error("Only user may import published templates");
             const { template, version } = c.payload;

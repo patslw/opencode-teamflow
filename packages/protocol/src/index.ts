@@ -11,6 +11,8 @@ export interface MemberLaunch {
   scope: BackendScope; runId: string; memberId: string; parentMemberId?: string; role: string; brief: string;
   model?: { providerID: string; id: string };
   writes?: boolean;
+  discussionOnly?: boolean;
+  allowDefaultAgentFallback?: boolean;
   sessionId?: string; taskId?: string; dispatchId?: string;
 }
 export interface MemberDelivery { messageId: string; sessionId: string; text: string; source: string; intent: "queue" | "steer"; resume?: boolean }

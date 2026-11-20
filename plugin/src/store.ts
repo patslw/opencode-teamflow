@@ -146,7 +146,7 @@ export async function openStore(dataDirectory: string): Promise<TeamflowStore> {
           scope, revision: legacy?.revision ?? 0, templates: [], versions: [], runs: [],
           members: (legacy?.members ?? []).map((m: unknown) => ({ ...(m as object), legacy: true })),
           tasks: [], attempts: [], deliveries: [], approvals: [], messages: legacy?.messages ?? [],
-          topics: [], patches: [], drafts: [], corrections: [],
+          questions: [], topics: [], patches: [], drafts: [], corrections: [],
           audit: [{ id: randomUUID(), at: new Date().toISOString(), type: legacy ? "storage.migrated" : "storage.initialized", actor: "system", detail: legacy ? `Preserved ${legacy.members.length} legacy members, revision ${legacy.revision}; source retained: ${legacyFile}` : "Backend-level SQLite scope initialized" }],
         };
         db.query("INSERT INTO scopes VALUES(?,?)").run(key(scope), JSON.stringify(SnapshotSchema.parse(snapshot)));

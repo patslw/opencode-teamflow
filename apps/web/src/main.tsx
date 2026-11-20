@@ -14,6 +14,7 @@ import { CollaborationPanel } from "./CollaborationPanel";
 import { DraftView } from "./DraftView";
 import { PatchView } from "./PatchView";
 import { BackendChooser } from "./BackendChooser";
+import { TeamDesk } from "./TeamDesk";
 import {
   connectBackend,
   MutationRejectedError,
@@ -67,9 +68,6 @@ const currentAttempt = (s: TeamflowSnapshot, runId: string, nodeId: string) =>
   s.attempts
     .filter((a) => a.runId === runId && a.nodeId === nodeId)
     .sort((a, b) => b.round - a.round)[0];
-function Json({ value }: { value: unknown }) {
-  return <pre>{pretty(value)}</pre>;
-}
 function Field({
   title,
   value,
@@ -135,6 +133,8 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
   const [unresolved, setUnresolved] = useState<MutationEnvelope>();
   const [versionId, setVersionId] = useEditorState("", editorEpoch);
   const [runId, setRunId] = useEditorState("", editorEpoch);
+  const [studio,setStudio] = useState(false);
+  const [studioTab,setStudioTab]=useState<"discuss"|"graph"|"start">("discuss");
   const [nodeId, setNodeId] = useEditorState("", editorEpoch);
   const [memberId, setMemberId] = useEditorState("", editorEpoch);
   const [draft, setDraft] = useEditorState<WorkflowVersion | undefined>(
@@ -244,12 +244,12 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
           (t) => t.id === command.payload.taskId,
         );
         setNotice(
-          `后端核对结果（不是自动解锁）：${pretty(command.payload.action === "inspect" ? task?.inspection : task?.reconciliation)}`,
+          `任务核对：${(command.payload.action === "inspect" ? task?.inspection : task?.reconciliation)?.evidence.join("；") || "暂时无法确认执行状态。"}`,
         );
       } else if (command.type === "message.reconcile") {
         const task = result.snapshot.tasks.find(t => t.messageInspection?.messageId === command.payload.messageId || t.messageRecovery?.messageId === command.payload.messageId);
         const recovery = command.payload.action === "inspect" ? task?.messageInspection : task?.messageRecovery;
-        setNotice(command.payload.action === "adopt" ? "用户已显式授权未发出的旧意图继续；尚非原生接收或处理确认。" : `消息据证核对（不是重发或自动解锁）：${pretty(recovery)}`);
+        setNotice(command.payload.action === "adopt" ? "用户已显式授权未发出的旧意图继续；尚非原生接收或处理确认。" : `消息据证核对（不是重发或自动解锁）：${recovery?.evidence.join("；") || "暂无新证据"}`);
       } else
         setNotice(
           `后端已提交 ${command.type}${command.type === "run.start" ? ` · runId=${command.payload.runId}` : command.type === "template.import" ? ` · version=${command.payload.version.id}` : ""} · revision ${result.revision}${result.resyncRequired ? "；通知未送达，已重新读取快照" : ""}`,
@@ -377,31 +377,19 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
         },
       }));
   };
+  if (!studio) return <>
+    {(error || unresolved || connectionState.includes("失败") || connectionState.includes("断开")) && <div className="desk-notifications" role="alert">
+      {error && <details open><summary>这次操作没有确认成功</summary><p>{error}</p><button onClick={()=>setError("")}>收起提示</button></details>}
+      {unresolved && <><span>上次操作的结果还不确定。</span><button disabled={pending} onClick={()=>void performMutation(unresolved.command,true)}>核对上一次操作</button></>}
+      {connectionState!=="已连接"&&<button onClick={()=>setReconnect(x=>x+1)}>重新连接项目</button>}
+    </div>}
+    {snapshot ? <TeamDesk s={snapshot} run={run} busy={pending||!!unresolved} active={active} connection={connection.current}
+      choose={selectRun} mutate={mutate} design={id=>{selectVersion(id??published?.id??"");setStudioTab("discuss");setStudio(true)}} inspect={id=>{selectRun(id);setStudioTab("graph");setStudio(true)}}/>:<div className="studio-bar">正在打开工作台…</div>}
+    </>;
   return (
-    <div className="app">
-      <header>
-        <div className="brand">
-          ◈ <b>Teamflow</b> <span>DEMO / 工作流控制台</span>
-        </div>
-        <div className="scope">
-          <b>{scope?.backendId ?? selectedScope.backendId}</b>
-          <code>{scope?.projectDirectory ?? "正在验证项目身份…"}</code>
-        </div>
-        <div className="connection">
-          <span
-            className={connectionState === "已连接" ? "dot online" : "dot"}
-          />
-          {connectionState}
-          <button
-            onClick={() => {
-              setError("");
-              setReconnect((x) => x + 1);
-            }}
-          >
-            重新连接
-          </button>
-        </div>
-      </header>
+    <div className="app design-studio" data-pane={studioTab}>
+      <div className="studio-bar"><button onClick={()=>{if(leaveDraft())setStudio(false)}}>← 返回团队对话</button><b>{run?"流程和工作记录":"设计工作流程"}</b></div>
+
       <div className="messages" aria-live="polite">
         {error && (
           <div className="error" role="alert">
@@ -473,72 +461,12 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
             >
               明确处理未决项后允许新操作
             </button>
-            <details>
-              <summary>保留的原始 envelope / 输入</summary>
-              <Json value={unresolved} />
-            </details>
+
           </div>
         )}
       </div>
       <div className="workspace">
-        <aside className="sidebar">
-          <h2>模板 / 版本</h2>
-          {snapshot?.templates.map((t) => (
-            <section key={t.id}>
-              <h3>{t.name}</h3>
-              <p>{t.description}</p>
-              {snapshot.versions
-                .filter((v) => v.templateId === t.id)
-                .map((v) => (
-                  <button
-                    className={
-                      !runId && published?.id === v.id ? "nav active" : "nav"
-                    }
-                    key={v.id}
-                    onClick={() => selectVersion(v.id)}
-                  >
-                    {v.id}
-                    <small>{v.releaseNotes}</small>
-                  </button>
-                ))}
-            </section>
-          ))}
-          <h2>
-            运行实例 <span>{snapshot?.runs.length ?? 0}</span>
-          </h2>
-          {snapshot?.runs
-            .slice()
-            .reverse()
-            .map((r) => (
-              <button
-                key={r.id}
-                className={runId === r.id ? "nav active" : "nav"}
-                onClick={() => selectRun(r.id)}
-              >
-                <span className={`status ${r.status}`}>{label(r.status)}</span>
-                <b>{r.label}</b>
-                <small>{r.id}</small>
-              </button>
-            ))}
-          <h2>原始探针会话</h2>
-          {snapshot?.members
-            .filter((m) => m.legacy)
-            .map((m) => (
-              <button
-                className="nav"
-                key={m.id}
-                onClick={() => setMemberId(m.id)}
-              >
-                {m.id}
-                <small>{m.sessionId}</small>
-              </button>
-            ))}
-          <div className="muted">
-            后端唯一权威 · revision {snapshot?.revision ?? "—"}
-            <br />
-              共享草稿与独立设计：图下方；单实例 patch：运行视图。
-          </div>
-        </aside>
+
         <main>
           {member && snapshot ? (
             <SessionView
@@ -557,7 +485,7 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
               <div className="page-title">
                 <div>
                   <span className="eyebrow">
-                    {run ? "实例 / 后端实时状态" : "模板 / 不可变发布版本"}
+                    {run ? "团队工作记录" : "流程设计室"}
                   </span>
                   <h1>
                     {run?.label ??
@@ -566,7 +494,7 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
                       )?.name ??
                       "正在载入工作流…"}
                   </h1>
-                  <code>{run?.id ?? version?.id}</code>
+                  {!run&&snapshot&&<label>选择流程 <select value={published?.id} onChange={e=>selectVersion(e.target.value)}>{snapshot.versions.map((v,i)=><option value={v.id} key={v.id}>{snapshot.templates.find(t=>t.id===v.templateId)?.name} · {v.parentVersionId?"修订版":"初版"} ({i+1})</option>)}</select></label>}
                 </div>
                 {run && (
                   <span className={`status ${run.status}`}>
@@ -574,7 +502,7 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
                   </span>
                 )}
               </div>
-              {run && snapshot && <RunEntry key={run.id} run={run} snapshot={snapshot} connection={connection.current} openMember={setMemberId} />}
+              <div className="studio-tabs" role="group" aria-label="流程工具"><button aria-pressed={studioTab==="discuss"} onClick={()=>setStudioTab("discuss")}>{run?"变更这次流程":"与设计者讨论"}</button><button aria-pressed={studioTab==="graph"} onClick={()=>setStudioTab("graph")}>查看流程图</button>{!run&&<button aria-pressed={studioTab==="start"} onClick={()=>setStudioTab("start")}>使用或导入流程</button>}</div><div hidden={studioTab!=="discuss"}>
               {snapshot && !run && <DraftView active={active} snapshot={snapshot} version={published} localVersion={draft}
                 pending={pending || !!unresolved} mutate={mutate} connection={connection.current}
                 touched={() => { editorEpoch.current++; setDraftPanelInput(true); }}
@@ -582,11 +510,12 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
                 preview={(v) => {
                   if (draft && pretty({ graph: draft.graph, roles: draft.roles }) !== pretty({ graph: v.graph, roles: v.roles }) &&
                     !confirm("图编辑器已有未保存的本地图/提示词输入。预览此面板草稿将替换它们（不会自动保存）。取消可完整保留当前图；请先采用到面板或复制备份。明确替换？")) return;
-                  setDraft(v); setNodeId(""); setMemberId("");
+                  setDraft(v); setNodeId(""); setMemberId(""); setStudioTab("graph");
                 }}
               />}
               {snapshot && run && <PatchView key={run.id} snapshot={snapshot} runId={run.id} pending={pending || !!unresolved} mutate={mutate} />}
-              {version && (
+              </div>
+              {version && studioTab!=="discuss" && (
                 <>
                   <div className="toolbar">
                     <span>
@@ -892,7 +821,7 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
                                  !draftPanelInput &&
                                  epoch === editorEpoch.current
                               ) {
-                                setRunId(id);
+                                setRunId(id); setStudio(false);
                                 setDraft(undefined);
                                 setSelectedEdge(undefined);
                                 setRunLabel("");
@@ -904,13 +833,8 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
                           </button>
                           <p>本地修改请在“共享草稿 / 独立设计会话”采用并保存，经过独立设计后显式发布。</p>
                           <details>
-                            <summary>导入完整 template / version JSON</summary>
-                            <Field
-                              title="严格协议 {template, version}；digest 须有效"
-                              value={importText}
-                              onChange={setImportText}
-                              multiline
-                            />
+                            <summary>从文件导入流程</summary>
+                             <input aria-label="选择流程文件" type="file" accept="application/json,.json" onChange={async e=>{const f=e.target.files?.[0];if(!f)return;try{if(f.size>65536)throw new Error("文件超过 64 KB");setImportText(await f.text())}catch(e){setImportText("");setError(String(e))}}}/>
                             <button
                               disabled={pending || !!unresolved || !importText}
                               onClick={async () => {
@@ -953,8 +877,7 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
                             </button>
                           </details>
                           <details>
-                            <summary>发布版本元数据 / 导出</summary>
-                            <Json value={published} />
+                            <summary>导出流程文件</summary><button disabled={!published} onClick={()=>{if(!published)return;const template=snapshot?.templates.find(t=>t.id===published.templateId);if(!template)return;const url=URL.createObjectURL(new Blob([pretty({template,version:published})],{type:"application/json"}));const link=document.createElement("a");link.href=url;link.download="teamflow-template.json";link.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}}>下载已发布的版本</button>
                           </details>
                         </>
                       )}
@@ -967,7 +890,7 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
         </main>
       </div>
       <footer>
-        Teamflow 功能 Demo · 不代表用户验收 · 状态、批准、派工均以真实后端为准
+        Teamflow · 工作流程设计
       </footer>
     </div>
   );
@@ -1329,7 +1252,7 @@ function RunEvidence({
     if (!binding) return;
     if (
       !confirm(
-        `${reject ? "打回返工" : "批准此 Gate"}？\n${pretty(binding)}\n此操作仅代表你对此次交付的明确决定。`,
+        `${reject ? "打回返工" : "批准此 Gate"}？\n${delivery?.summary ?? ""}\n此操作仅代表你对此次交付的明确决定。`,
       )
     )
       return;
@@ -1404,7 +1327,7 @@ function RunEvidence({
         <fieldset>
           <legend>用户决定</legend>
           <p>仅当前 Gate 与源节点最高轮交付。后端仍核对专业检查及版本。</p>
-          {binding && <Json value={binding} />}
+
           <Field
             title="打回原因"
             value={reason}
@@ -1452,7 +1375,7 @@ function RunEvidence({
             <summary>
               {a.kind} · {a.verdict} · {a.valid ? "后端有效" : "已失效"}
             </summary>
-            <Json value={a} />
+            <p>{a.issues.join("；") || "没有附加意见"}</p>
           </details>
         ))}
       <h3>成员 / 原始会话</h3>
@@ -1471,46 +1394,9 @@ function RunEvidence({
       {tasks.map((t) => (
         <TaskControl key={t.id} task={t} mutate={mutate} pending={pending} />
       ))}
-      <details>
-        <summary>历史尝试、交付与全实例成员</summary>
-        <h4>历史批准（包含已失效记录）</h4>
-        <Json value={s.approvals.filter((a) => a.runId === runId)} />
-        <h4>历史派工（不自动恢复）</h4>
-        <Json value={s.tasks.filter((t) => t.runId === runId)} />
-        <h4>历史定义快照（按 attempt.versionId，不按实例新版本重解释）</h4>
-        {[...new Set(s.attempts.filter(a => a.runId === runId).map(a => a.versionId ?? version.id))].map(id => (
-          <details key={id}><summary>{id}</summary><Json value={s.versions.find(v => v.id === id)} /></details>
-        ))}
-        <Json
-          value={s.attempts.filter(
-            (a) => a.runId === runId && (!node || a.nodeId === node.id),
-          )}
-        />
-        <Json
-          value={s.deliveries.filter(
-            (d) =>
-              d.runId === runId &&
-              (!node ||
-                s.attempts.some(
-                  (a) =>
-                    a.id === d.attemptId &&
-                    (a.nodeId === node.id || a.nodeId === node.sourceNodeId),
-                )),
-          )}
-        />
-        {s.members
-          .filter((m) => m.runId === runId)
-          .map((m) => (
-            <button key={m.id} onClick={() => openMember(m.id)}>
-              {m.role} · {m.sessionId}
-            </button>
-          ))}
-      </details>
+      <details><summary>往轮交付</summary>{s.deliveries.filter(d=>d.runId===runId).map(d=><article key={d.id}><b>{d.staleBy?"历史版本":"已交付"}</b><p>{d.summary}</p></article>)}</details>
       <CollaborationPanel snapshot={s} runId={runId} mutate={mutate} pending={pending} />
-      <details>
-        <summary>实例模板 {version.id} / 审计</summary>
-        <Json value={s.audit.slice(-30)} />
-      </details>
+
     </>
   );
 }
@@ -1554,14 +1440,7 @@ function TaskControl({
       {t.error && <p className="error">{t.error}</p>}
       <details open={t.status === "uncertain"}>
         <summary>派工阶段、核对结果与证据</summary>
-        <Json
-          value={{
-            sessionId: t.sessionId,
-            dispatch: t.dispatch,
-            inspection: t.inspection,
-            reconciliation: t.reconciliation,
-          }}
-        />
+        <p>{t.inspection?.evidence.join("；") ?? t.reconciliation?.evidence.join("；") ?? "尚未进行人工核对。"}</p>
       </details>
       {(t.status === "uncertain" ||
         t.slotHeld ||
@@ -1774,44 +1653,13 @@ function SessionView({
   );
 }
 function NativeMessage({ value }: { value: unknown }) {
-  if (!value || typeof value !== "object") return <Json value={value} />;
-  const record = value as Record<string, any>;
-  const parts = Array.isArray(record.parts)
-    ? record.parts
-    : Array.isArray(record.content)
-      ? record.content
-      : [];
-  return (
-    <article className="native-message">
-      <h3>
-        {record.info?.role ?? record.role ?? record.type ?? "原生消息"}{" "}
-        <small>{record.info?.id ?? record.id}</small>
-      </h3>
-      {typeof record.text === "string" && <pre>{record.text}</pre>}
-      {parts.map((p: Record<string, any>, i: number) =>
-        p.type === "text" ? (
-          <pre key={i}>{p.text}</pre>
-        ) : p.type === "tool" || p.tool ? (
-          <details key={i} open>
-            <summary>
-              工具 {p.tool ?? p.name} ·{" "}
-              {p.state?.status ?? p.status ?? "未知状态"}
-            </summary>
-            <Json value={p} />
-          </details>
-        ) : (
-          <details key={i}>
-            <summary>{p.type ?? "消息部分"}</summary>
-            <Json value={p} />
-          </details>
-        ),
-      )}
-      <details>
-        <summary>查看原生结构</summary>
-        <Json value={value} />
-      </details>
-    </article>
-  );
+  if (!value || typeof value !== "object") return null;
+  const record=value as Record<string,any>;const role=record.info?.role??record.role;
+  if(role!=="assistant"&&role!=="user")return null;
+  const parts=record.parts??record.content??[];
+  const text=(Array.isArray(parts)?parts:[]).filter(p=>p.type==="text"&&!p.synthetic&&typeof p.text==="string").map(p=>p.text).join("\n")||record.text;
+  if(typeof text!=="string"||!text.trim()||text.startsWith("[Teamflow source:"))return null;
+  return <article className="native-message"><b>{role==="assistant"?"成员回复":"我"}</b><p>{text}</p></article>;
 }
 
 createRoot(document.getElementById("root")!).render(

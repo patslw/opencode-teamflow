@@ -3,6 +3,7 @@ import type { ActorContext, Delivery, Run, StageAttempt, TeamflowCommand, Teamfl
 import { patchBlocks } from "./patches.js";
 import { recoveryBlocks } from "./execution-fence.js";
 import { escalate } from "./escalation.js";
+import { assertQuestionResolved, blockingQuestion, confirmedQuestions, isDiscussion, settleQuestions } from "./questions.js";
 export const now = () => new Date().toISOString();
 export const uid = () => randomUUID();
 export function audit(s: TeamflowSnapshot, type: string, actor: ActorContext, detail: string) {
@@ -105,13 +106,16 @@ export function advance(s: TeamflowSnapshot) {
     }
     const attempts = v.graph.nodes.map(n => current(s, run.id, n.id)!);
     const patches = s.patches.filter(p => p.runId === run.id && ["waiting_boundary", "review_required"].includes(p.status));
+    const waiting = s.tasks.filter(t => t.runId === run.id && t.status === "running").map(t => ({ t, q: blockingQuestion(s, t) })).filter(x => x.q);
     if (!patches.length && attempts.every(a => a.status === "passed" && !a.supersededBy)) { run.status = "completed"; delete run.waitingReason; }
-    else if (attempts.some(a => !a.supersededBy && (a.status === "ready" || a.status === "running"))) { run.status = "running"; delete run.waitingReason; }
+    else if (attempts.some(a => !a.supersededBy && (a.status === "ready" || a.status === "running" && !waiting.some(({ t }) => !t.child && t.attemptId === a.id)))) { run.status = "running"; delete run.waitingReason; }
     else { run.status = "waiting"; run.waitingReason = [
+      ...waiting.map(({ t, q }) => q!.status === "open" ? `等待成员 ${t.memberId} 的用户答复` : `用户已回复，等待送达原成员 ${t.memberId}`),
       ...patches.map(p => p.status === "review_required" ? `Approved workflow patch ${p.id}: user re-review required; ${p.reviewRequired?.reason ?? "inspect saved patch"}` : `Approved workflow patch ${p.id}: waiting for affected native safe boundary`),
       ...attempts.filter(a => !a.supersededBy && (a.status === "awaiting_gate" || a.status === "failed")).map(a => `${a.nodeId}: ${a.status === "failed" ? a.reason ?? "failed" : "required user approval / professional checks"}`),
     ].join("; ") || "Waiting for dependencies"; }
   }
+  settleQuestions(s);
 }
 type CoreCommand = Extract<TeamflowCommand, { type: "task.submit" | "review.submit" | "gate.approve" | "gate.reject" }>;
 export function executeSubmission(s: TeamflowSnapshot, command: CoreCommand, actor: ActorContext) {
@@ -149,12 +153,16 @@ export function executeSubmission(s: TeamflowSnapshot, command: CoreCommand, act
     s.approvals.some(p => p.valid && p.attemptId === a.id && p.actorId === actor.sessionId && p.verdict === "pass");
   if (!member || member.legacy || !task || task.sessionId !== actor.sessionId || member.taskId !== task.id ||
     task.child || member.role !== node.role ||
-    (!lateVeto && (task.executionMode === "conversation" || task.status !== "running"))) throw new Error("Forbidden: caller does not own active workflow execution; admitted current professional conversation may only veto its existing pass");
+    (!lateVeto && (!task.slotHeld || task.executionMode === "conversation" || task.status !== "running"))) throw new Error("Forbidden: caller does not own active workflow execution; admitted current professional conversation may only veto its existing pass");
+  assertQuestionResolved(s, task);
   if (command.type === "task.submit") {
     const p = command.payload;
     if (node.kind !== "work" || a.status !== "running" || task.status !== "running" || p.taskId !== task.id || p.criteriaRevision !== a.criteriaRevision) throw new Error("Invalid work submission or criteria revision");
     if (p.checks.some(c => c.version !== p.artifactRevision || c.source !== "self_report")) throw new Error("Self checks must identify current artifact and self_report provenance");
-    s.deliveries.push({ id: uid(), runId: run.id, attemptId: a.id, memberId: member.id, sessionId: actor.sessionId, artifactRevision: p.artifactRevision, criteriaRevision: p.criteriaRevision, artifacts: p.artifacts, summary: p.summary, checks: p.checks, unresolved: p.unresolved, createdAt: now() });
+    const confirmed = confirmedQuestions(s, task);
+    if (isDiscussion(s, a.id) && !confirmed.length) throw new Error("Before submitting a proposal, ask a real business question and receive a reply in this discussion session");
+    s.deliveries.push({ id: uid(), runId: run.id, attemptId: a.id, memberId: member.id, sessionId: actor.sessionId, artifactRevision: p.artifactRevision, criteriaRevision: p.criteriaRevision, artifacts: p.artifacts, summary: p.summary, checks: p.checks, unresolved: p.unresolved, createdAt: now(),
+      ...(confirmed.length ? { confirmedQuestions: confirmed } : {}) });
     task.status = "submitted"; task.executionMode = "conversation";
     // "passed" here completes the work node, not acceptance. Its blocking evidence
     // remains attached and prevents the actual Gate; independent checks may return it.

@@ -4,6 +4,7 @@ import { conversationEligible, recoveryBlocks, unresolvedIO } from "./execution-
 import { preserveLegacyEscalation, resolutionBasis, resolveEscalation } from "./escalation.js";
 import type { TeamflowStore } from "./store.js";
 import { assertTopicActor, associationFor, type Association } from "./topic-policy.js";
+import { assertQuestionResolved } from "./questions.js";
 
 const nativeId = () => `msg_${uid().replaceAll("-", "")}`;
 export function enqueue(s: TeamflowSnapshot, runId: string, from: string, to: string, text: string, extra: Partial<TeamflowMessage> = {}) {
@@ -71,6 +72,7 @@ export function collaborate(s: TeamflowSnapshot, c: TeamflowCommand, actor: Acto
       if (["user", "user-correction", "topic-exchange"].includes(p.memberId)) throw new Error("Reserved sender identity");
       if (s.members.some(m => m.id === p.memberId) || s.tasks.some(t => t.memberId === p.memberId)) throw new Error("Member ID already registered/reserved");
       const task = s.tasks.find(t => t.id === parent.taskId)!;
+      assertQuestionResolved(s, task);
       const v = attemptVersion(s, s.attempts.find(a => a.id === task.attemptId)!), parentRole = v.roles.find(r => r.id === parent.role)!, role = v.roles.find(r => r.id === p.role);
       let depth = 1, ancestor = parent;
       while (ancestor.parentMemberId) { depth++; ancestor = s.members.find(m => m.id === ancestor.parentMemberId)!; }
@@ -90,6 +92,7 @@ export function collaborate(s: TeamflowSnapshot, c: TeamflowCommand, actor: Acto
     case "member.finish": {
       const t = s.tasks.find(t => t.id === c.payload.taskId);
       if (!t?.child || t.status !== "running" || t.child.completedAt || memberActor(s, actor, t.runId, true).id !== t.memberId) throw new Error("Only active child owner may finish once; completion history is immutable");
+      assertQuestionResolved(s, t);
       // Completion is a factual history, applicability is a separate field.
       const a = associationFor(s, t.runId, t.memberId, t.child.parentMemberId, c.payload, true);
       if (a.topicId) t.child.topicId = a.topicId; // preserve the explicit result association for later relays

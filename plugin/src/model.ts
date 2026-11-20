@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { VersionSchema, type WorkflowVersion } from "../../packages/protocol/src/index.js";
 import { bugFix } from "./templates/bug-fix.js";
 import { requireDevelopment } from "./templates/require-development.js";
+import { proposalGateId, teamConversation, teamConversationId } from "./templates/team-conversation.js";
 const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical) : value !== null && typeof value === "object" ? Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, canonical(v)])) : value;
 export const digestVersion = (v: Pick<WorkflowVersion, "templateId" | "graph" | "roles">) => createHash("sha256").update(JSON.stringify(canonical({ templateId: v.templateId, graph: v.graph, roles: v.roles }))).digest("hex");
 export function validateVersion(input: WorkflowVersion) {
@@ -52,9 +53,20 @@ export function validateVersion(input: WorkflowVersion) {
     if (!["gate", "review", "test"].includes(nodes.find(n => n.id === e.from)!.kind) || nodes.find(n => n.id === e.to)!.kind !== "work" || !reach(e.to).has(e.from)) throw new Error("Invalid return target");
   }
   for (const r of v.roles) if (r.childRoles.some(id => !roles.has(id))) throw new Error("Unknown child role");
+  if (v.templateId === teamConversationId) {
+    const discussion = nodes.find(n => n.id === entry)!;
+    const confirmation = nodes.find(n => n.id === proposalGateId);
+    if (discussion.kind !== "work" || discussion.writes || discussion.mode !== "analysis" ||
+      v.roles.find(r => r.id === discussion.role)?.childRoles.length || !confirmation?.gate?.user ||
+      confirmation.sourceNodeId !== entry || normal.filter(e => e.from === entry).length !== 1 ||
+      !normal.some(e => e.from === entry && e.to === proposalGateId) ||
+      normal.filter(e => e.to === proposalGateId).length !== 1) {
+      throw new Error("Conversation template must start with read-only discussion followed by explicit user confirmation before other nodes");
+    }
+  }
   return v;
 }
-export const builtins = [bugFix, requireDevelopment].map(({ template, graph, roles }) => {
+export const builtins = [bugFix, requireDevelopment, teamConversation].map(({ template, graph, roles }) => {
   const content = { templateId: template.id, graph, roles };
   const version = validateVersion({ ...content, id: `${template.id}@1`, releaseNotes: "Built-in demo v1", digest: digestVersion(content), publishedAt: "2026-11-16T00:00:00.000Z" });
   return { template, version };

@@ -4,7 +4,8 @@ description: Scoped independent Teamflow collaboration, handled acknowledgements
 ---
 # Teamflow collaboration
 
-- Read teamflow_context for your real identity, assigned task and registered peers. Never supply another member's identity or claim to be the user.
+- Open the native `execute` tool and run `return await tools.teamflow.context({});` for your real identity, assigned task and registered peers. To discover the schemas inside `execute`, use `return search({namespace:"teamflow"});`. Never supply another member's identity or claim to be the user.
+- Use `return await tools.teamflow.command({type:"question.ask",payload:{question:"<your concrete question>"}});` to ask the actual user when an answer could change your task. End the turn and wait for a real answer; a prose question is not a recorded request, and an answer is not Gate approval. Use the same `tools.teamflow.command` path for other tracked operations.
 - Use only relevant task input. Sessions are fresh, not coordinator forks. Native subagent is denied; member.spawn is the only registered child path (default depth 2, shared slot limit). Auxiliary children are read-only and have a logical parent; no native automatic parent wake.
 - message.send persists intent. The scheduler admits same-session continuations, reacquiring slots and the original writer lease before resume. API admission, native observation and message.ack are distinct. Acknowledge only actually handled delivered messages, never cancelled/uncertain ones. Unknown calls need trusted message.reconcile, not blind resend.
 - Pre-fix non-waking intents are not automatic wakeup permission. Only the trusted user may adopt a genuinely never-issued applicable intent; unknown calls cannot be adopted or resent.

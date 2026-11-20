@@ -158,6 +158,28 @@ export default Plugin.define({
             topic.conclusion && `结论（不是批准）：${topic.conclusion}`, topic.escalationReason,
           ].filter(Boolean).join("\n\n"));
         };
+        const showQuestions = async (snapshot: TeamflowSnapshot, runId: string) => {
+          const questions = snapshot.questions.filter(q => q.runId === runId).reverse();
+          if (!questions.length) { await alert("成员提问", "暂无成员提问。"); return; }
+          const status = { open: "等待答复", answered: "已答复", superseded: "已失效" } as const;
+          const id = await context.ui.dialog.select({ title: "成员提问", options: questions.map(q => ({
+            title: q.question, description: `${snapshot.members.find(m => m.id === q.memberId)?.role ?? q.memberId} · ${status[q.status]}`, value: q.id,
+          })) });
+          const q = questions.find(q => q.id === id);
+          if (!q) return;
+          if (q.status !== "open") {
+            await alert(`成员提问 · ${status[q.status]}`, `${q.question}\n\n${q.answer ?? "未答复"}`); return;
+          }
+          const answer = await context.ui.dialog.prompt({
+            title: "回复成员", description: `${q.question}\n回复只发给提问者（${q.memberId}），不代表方案确认或验收。`,
+          });
+          if (!answer?.trim()) return;
+          const fresh = await read();
+          if (!fresh.questions.some(x => x.id === q.id && x.status === "open")) {
+            await alert("问题已变化，未发送", answer); return;
+          }
+          await submit(fresh, { type: "question.answer", payload: { questionId: q.id, answer } }, answer);
+        };
         const showNode = async (runId: string, nodeId: string) => {
           // Each return to a node reads fresh authority, including catalog changes at the same revision.
           let savedReason = "";
@@ -193,7 +215,7 @@ export default Plugin.define({
               await alert("节点状态", `run ${run.id} · ${run.status}\nnode ${node.id} · ${node.kind}\nattempt ${attempt.id} · ${attempt.status} · round ${attempt.round}\n${attempt.reason ?? ""}\n${tasks.map(t => `task ${t.id}: ${t.status}, slotHeld=${t.slotHeld}${t.error ? `, ${t.error}` : ""}\n${t.inspection ? `inspection: ${JSON.stringify(t.inspection)}\n` : ""}${t.reconciliation ? `reconciliation: ${JSON.stringify(t.reconciliation)}` : ""}`).join("\n") || "无派工"}`);
             } else if (action === "evidence") {
               const entries = [
-                ...(delivery ? [{ title: `源交付 ${delivery.id}`, value: `源 attempt ${delivery.attemptId}\n产物 ${delivery.artifactRevision}\n标准 ${delivery.criteriaRevision}\n摘要 ${delivery.summary}\n文件 ${delivery.artifacts.join(", ")}\n未解决 ${delivery.unresolved.join(", ") || "无"}` }, ...delivery.checks.map((check, i) => ({ title: `自检 ${i + 1} · exit ${check.exitCode}`, value: JSON.stringify(check, null, 2) }))] : []),
+                ...(delivery ? [{ title: `源交付 ${delivery.id}`, value: `源 attempt ${delivery.attemptId}\n产物 ${delivery.artifactRevision}\n标准 ${delivery.criteriaRevision}\n摘要 ${delivery.summary}\n文件 ${delivery.artifacts.join(", ")}\n未解决 ${delivery.unresolved.join(", ") || "无"}${delivery.confirmedQuestions?.map(q => `\n问题：${q.question}\n已确认：${q.answer}`).join("\n") ?? ""}` }, ...delivery.checks.map((check, i) => ({ title: `自检 ${i + 1} · exit ${check.exitCode}`, value: JSON.stringify(check, null, 2) }))] : []),
                 ...relevant.map(a => ({ title: `${a.kind} ${a.verdict} · ${a.valid ? "有效" : "历史失效"}`, value: JSON.stringify(a, null, 2) })),
               ];
               if (!entries.length) { await alert("证据", "当前尚无源交付或审批证据。"); continue; }
@@ -256,6 +278,7 @@ export default Plugin.define({
             const nodeId = await context.ui.dialog.select({
               title: `${run.label} · ${run.status}${run.entry?.state === "pending" ? " · 主会话准备中" : ""}${run.waitingReason ? ` · ${run.waitingReason}` : ""}`,
               options: [
+                { title: "成员提问与答复", value: ":questions", description: `${snapshot.questions.filter(q => q.runId === runId && q.status === "open").length} 个待答` },
                 { title: "成员私聊", value: ":members" },
                 { title: "团队议题", value: ":topics" },
                 ...(run.entry ? [{ title: run.entry.state === "ready" ? "打开原生团队主会话" : "核对主会话准备状态", value: ":main", description: run.entry.sessionId }] : []),
@@ -268,7 +291,8 @@ export default Plugin.define({
               ],
             });
             if (!nodeId) return;
-            if (nodeId === ":members") await chooseMember(snapshot, runId);
+            if (nodeId === ":questions") await showQuestions(snapshot, runId);
+            else if (nodeId === ":members") await chooseMember(snapshot, runId);
             else if (nodeId === ":topics") await showTopics(snapshot, runId);
             else if (nodeId === ":main" && run.entry) {
               if (run.entry.state === "ready") { await openMain(run.entry.sessionId); return; }

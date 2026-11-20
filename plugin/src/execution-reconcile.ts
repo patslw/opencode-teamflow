@@ -4,6 +4,7 @@ import { writerKey } from "./dispatch.js";
 import { bumpIO, mayRelease, recoveryBlocks, unresolvedIO } from "./execution-fence.js";
 import type { OpenCodeAdapter } from "./opencode-adapter.js";
 import type { TeamflowStore } from "./store.js";
+import { blockingQuestion } from "./questions.js";
 
 export async function reconcileExecutions(d: {
   store: TeamflowStore; adapter: OpenCodeAdapter; scope: BackendScope; owner: string;
@@ -76,10 +77,11 @@ export async function reconcileExecutions(d: {
         t.slotHeld = false; bumpIO(t);
         if (t.writes) store.release(writerKey(scope), t.id);
         const a = s.attempts.find(a => a.id === t.attemptId)!;
-        if (!t.child && t.executionMode !== "conversation" && t.status === "running" && a.status === "running") {
+        const question = blockingQuestion(s, t);
+        if (!question && !t.child && t.executionMode !== "conversation" && t.status === "running" && a.status === "running") {
           a.status = "failed"; a.reason = "Real session ended without structured workflow submission";
           t.error = a.reason;
-        } else if (t.child && t.status === "running") t.error = "Auxiliary session ended without member.finish; follow-up or trusted termination needed";
+        } else if (!question && t.child && t.status === "running") t.error = "Auxiliary session ended without member.finish; follow-up or trusted termination needed";
         audit(s, "session.reconciled", { kind: "system" }, `${t.id}: epoch ${observed.ioEpoch ?? 0}; native idle/tools/shell/inbox safe`);
         advance(s); s.revision++; return structuredClone(s);
       });

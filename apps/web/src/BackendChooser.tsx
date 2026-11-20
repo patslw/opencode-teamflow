@@ -27,15 +27,14 @@ export function BackendChooser({ workspace }: {
     setSelected(scope);
   }
   return <>
-    <section className="panel" aria-label="后端与项目选择">
+    <section className="project-strip" aria-label="工作地点"><strong>工作空间</strong><div>
       <label>后端 <select aria-label="后端" value={selected?.backendId ?? ""} onChange={e => {
         const b = catalog?.backends.find(b => b.backendId === e.target.value);
         if (b) choose({ backendId: b.backendId, projectDirectory: b.projects[0]! });
       }}>{catalog?.backends.map(b => <option key={b.backendId}>{b.backendId}</option>)}</select></label>
       <label>项目 <select aria-label="项目" value={selected?.projectDirectory ?? ""} onChange={e => selected && choose({ ...selected, projectDirectory: e.target.value })}>
-        {catalog?.backends.find(b => b.backendId === selected?.backendId)?.projects.map(p => <option key={p}>{p}</option>)}
-      </select></label>
-      <span> 仅管理员已配置的端点；切换保留各项目本页输入与未决身份，不自动重试。刷新页面前请保存/复制输入。</span>
+        {catalog?.backends.find(b => b.backendId === selected?.backendId)?.projects.map(p => <option key={p} value={p} title={p}>{p.split("/").filter(Boolean).at(-1) ?? p}</option>)}
+       </select></label></div>
       {error && <p role="alert">{error}</p>}
     </section>
     {visited.map(scope => <div key={key(scope)} hidden={key(scope) !== (selected && key(selected))}>

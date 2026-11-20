@@ -42,7 +42,8 @@ export async function design(deps: { store: TeamflowStore; adapter: OpenCodeAdap
         "Propose workflow graph/roles/prompts with necessity and impact; only explicit user publication/application changes a run.",
         `Initial draft: ${JSON.stringify(d)}`,
       ].join("\n\n");
-      const actual = await adapter.createMember({ scope: e.scope, runId: `design:${d.id}`, memberId: `designer:${d.id}`, role: c.payload.agent, brief, writes: false, sessionId });
+      const actual = await adapter.createMember({ scope: e.scope, runId: `design:${d.id}`, memberId: `designer:${d.id}`, role: c.payload.agent, brief, writes: false, sessionId,
+        model: await adapter.designerModel(c.payload.agent) });
       if (actual.sessionId !== sessionId) throw new Error("Designer session identity mismatch");
       await adapter.getSession(sessionId);
     } else {

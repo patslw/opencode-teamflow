@@ -4,6 +4,7 @@ import { Service } from "@opencode/client/service";
 import { readFile } from "node:fs/promises";
 import { z } from "zod";
 import type { BackendScope, MemberDelivery, MemberLaunch, MemberSession, Run, Task, TeamflowMessage } from "../../packages/protocol/src/index.js";
+import { discussionPermissions, teamflowToolInstructions } from "./tool-contract.js";
 
 export class DispatchNotSentError extends Error {}
 export interface DispatchInspection {
@@ -41,6 +42,11 @@ export class OpenCodeAdapter {
     }
   }
 
+  async designerModel(role: string): Promise<MemberLaunch["model"]> {
+    const selected = (await this.ctx.agent.get({ agentID: role })).data.model;
+    return selected ? { providerID: selected.providerID, id: selected.id } : undefined;
+  }
+
   async ensureRunEntry(scope: BackendScope, run: Run & { entry: NonNullable<Run["entry"]> }) {
     const id = run.entry.sessionId;
     // Use the authenticated client for a typed NotFound. No new ID is ever
@@ -63,7 +69,7 @@ export class OpenCodeAdapter {
     }
     await this.ctx.session.instructions.entry.put({
       sessionID: id, key: "teamflow.entry",
-      value: `This is the Teamflow main chat for run ${run.id}. User request:\n${run.brief}\n\nUse teamflow_context to read its real status. For running, approving, or chatting with members, direct the user to /teamflow (TUI) or the Teamflow web run. Do not impersonate members or launch native subagents for this run.`,
+      value: `This is the Teamflow main chat for run ${run.id}. User request:\n${run.brief}\n\nUse teamflow_context to read its real status. ${teamflowToolInstructions} For running, approving, or chatting with members, direct the user to /teamflow (TUI) or the Teamflow web run. Do not impersonate members or launch native subagents for this run.`,
     });
   }
 
@@ -71,30 +77,40 @@ export class OpenCodeAdapter {
     const parentID = launch.parentMemberId ? this.parentSession(launch.parentMemberId) : undefined;
     if (launch.parentMemberId && !parentID) throw new Error("Unknown parent member");
     let model: MemberLaunch["model"];
+    let agent = launch.role;
     let client: OpenCodeClient;
     try {
       client = await this.nativeClient();
-      await this.ctx.agent.get({ agentID: launch.role });
-      const selected = launch.model ?? (await this.ctx.model.default()).data;
+      if (launch.allowDefaultAgentFallback && !(await this.ctx.agent.list()).data.some(candidate => candidate.id === agent)) agent = "build";
+      const configured = (await this.ctx.agent.get({ agentID: agent })).data.model;
+      const available = launch.model || (launch.allowDefaultAgentFallback && configured) ? (await this.ctx.model.list()).data : undefined;
+      const enabled = (ref: NonNullable<typeof configured>) => available?.some(m => m.enabled && m.providerID === ref.providerID && m.id === ref.id);
+      if (launch.model && !enabled(launch.model)) throw new Error("Configured role model is not available on this backend");
+      const selected = launch.model ?? (launch.allowDefaultAgentFallback && configured && enabled(configured) ? configured : (await this.ctx.model.default()).data);
       if (!selected) throw new Error("No default model available");
       model = { providerID: selected.providerID, id: selected.id };
-      if (launch.model && !(await this.ctx.model.list()).data.some(m => m.enabled && m.providerID === selected.providerID && m.id === selected.id)) throw new Error("Configured role model is not available on this backend");
     } catch (error) { throw new DispatchNotSentError(error instanceof Error ? error.message || error.name : "Member preflight failed before session.create"); }
     const identity = { kind: "private", memberId: launch.memberId, runId: launch.runId, ...(launch.parentMemberId ? { parentMemberId: launch.parentMemberId } : {}), ...(launch.taskId ? { taskId: launch.taskId } : {}), ...(launch.dispatchId ? { dispatchId: launch.dispatchId } : {}) };
     const session = await this.ctx.session.create({
       ...(launch.sessionId ? { id: launch.sessionId } : {}),
       title: `Teamflow ${launch.memberId}: ${launch.brief.slice(0, 80)}`,
-      agent: launch.role,
+      agent,
       model: { providerID: model.providerID, id: model.id },
       // Logical, registered parent only. Native parentID automatically resumes the
       // parent on completion without a scheduler admission hook in SDK 2.3.0.
       // Never enable that unmetered execution path.
       location: { directory: launch.scope.projectDirectory },
       metadata: { teamflow: identity },
-      permissions: [
+      // Native 2.3.2 filters the Code Mode catalog using each tool's effective
+      // permission action before running model hooks. Leave execute enabled,
+      // allow only the read tools and our effective IDs, and deny e.g. webfetch.
+      permissions: launch.discussionOnly ? [
+        { action: "*", resource: "*", effect: "deny" },
+        ...discussionPermissions.map(action => ({ action, resource: "*", effect: "allow" as const })),
+      ] : [
         { action: "subagent", resource: "*", effect: "deny" },
         ...(launch.writes === false ? [{ action: "edit", resource: "*", effect: "deny" as const }] : []),
-        ...(launch.parentMemberId ? [{ action: "shell", resource: "*", effect: "deny" as const }] : []),
+        ...(launch.parentMemberId || launch.allowDefaultAgentFallback && launch.writes === false ? [{ action: "shell", resource: "*", effect: "deny" as const }] : []),
       ],
     });
     // Only the positively identified result of this exact new creation may be
@@ -139,12 +155,13 @@ export class OpenCodeAdapter {
       throw new Error(`Original native session ${sessionId} unavailable: ${reason}`);
     }
   }
-  async observeMessage(sessionId: string, messageId: string) {
-    const client = await this.nativeClient();
-    const inbox = await client.session.inbox.list({ sessionID: sessionId });
-    if (inbox.some(m => m.id === messageId)) return "observed_inbox" as const;
-    if ((await this.listMessages(sessionId)).some(m => m.id === messageId)) return "observed_context" as const;
-    return undefined;
+  async hasObservedMessage(sessionId: string, messageId: string, request: { source: string; text: string }) {
+    const message = (await this.listMessages(sessionId)).find(m => m.id === messageId);
+    if (!message) return false;
+    if (message.type !== "synthetic" || message.text !== `[Teamflow source: ${request.source}]\n${request.text}`) {
+      throw new Error("Native answer does not match its durable admission intent");
+    }
+    return true;
   }
   async inspectCollaboration(scope: BackendScope, task: Task, message: TeamflowMessage) {
     const native = await this.inspectDispatch(scope, task);

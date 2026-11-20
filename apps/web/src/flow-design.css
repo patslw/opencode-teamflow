@@ -1,0 +1,9 @@
+.flow-design { color: #233e32; }
+.flow-design .flow-design-card { background: #f7f4e9; border: 1px solid #d9dfce; border-radius: 14px; padding: 1rem; margin: 1rem 0; }
+.flow-design .flow-design-card h3 { margin-top: 0; color: #214b38; }
+.flow-design button { margin: .25rem .5rem .25rem 0; }
+.flow-design textarea { min-height: 5rem; }
+.flow-design details { margin: .75rem 0; }
+.flow-design summary { cursor: pointer; }
+.flow-design-message { background: #fffdf6; border-left: 3px solid #71907b; padding: .6rem .8rem; margin: .6rem 0; }
+.flow-design-message p { white-space: pre-wrap; overflow-wrap: anywhere; }

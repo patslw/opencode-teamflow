@@ -1,10 +1,10 @@
-# Teamflow for OpenCode · 0.1.0-alpha.2
+# Teamflow for OpenCode · 0.1.0-alpha.3
 
 在 OpenCode 里带一个小团队做开发：你和协调者讨论需求，成员在各自的会话工作；在流程图上查看交付、找具体成员私聊，由你决定批准还是返工。**Alpha 是可操作的演示版本**。它复用你已有的 OpenCode 服务和模型认证，不需要再启动一套 OpenCode。
 
 ## 从哪里开始
 
-- **第一次用**：按[安装与第一次验收](docs/guide/quickstart.md)跑一个只读的小任务。看到「等待你验收」就可以停下看结果，不用让 Agent 写任何代码。
+- **第一次用**：在首页说一个还没想清楚的想法。负责人先提问，得到你的回答、提交方案；你点「同意方案，开始制作」之前不会安排开发。见[第一次团队对话](docs/guide/quickstart.md)。
 - **多台服务器**：用 `npm run demo:web -- --host <本机局域网IP> --port 3180` 开启 HTTPS 网页；另见[配置远端后端和 SSH 跳板](docs/guide/network.md)。
 - **想试协作和改流程**：见[成员、议题、流程设计与补丁](docs/guide/workflows.md)。
 - **连不上或模型不回复**：见[排错、数据与停止方式](docs/guide/operations.md)。

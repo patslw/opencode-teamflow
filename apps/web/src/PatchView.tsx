@@ -2,8 +2,8 @@ import React, { useState } from "react";
 import type { MutationResult, TeamflowCommand, TeamflowSnapshot } from "../../../packages/protocol/src/index";
 import { patchImpact as impact } from "../../../packages/protocol/src/index";
 import { PatchProposal } from "./PatchProposal";
+import { DefinitionChanges } from "./PatchRecovery";
 
-const pretty = (v: unknown) => JSON.stringify(v, null, 2);
 // Preview is advisory; backend independently computes and validates the impact.
 export function PatchView({ snapshot: s, runId, pending, mutate }: {
   snapshot: TeamflowSnapshot; runId: string; pending: boolean;
@@ -16,27 +16,22 @@ export function PatchView({ snapshot: s, runId, pending, mutate }: {
   const mappings = base.graph.nodes.map(n => ({
     nodeId: n.id, action: !affected.includes(n.id) ? "retain" as const : next?.graph.nodes.some(x => x.id === n.id) ? "replace" as const : "remove" as const,
   }));
-  return <section aria-label="工作流 patch">
-    <h2>单实例 patch / 图与提示词影响比较</h2>
-    <p>仅应用到 {run.id}。旧尝试、会话、交付、子任务完成事实保留；相关批准失效。定义回退不撤销代码。相关任务等待真实原生安全边界，其他工作/实例不升级。</p>
+  return <section aria-label="工作流 patch" className="flow-design">
+    <h2>将已发布方案用于当前工作</h2>
+    <p>先比较并记录提案，再单独确认应用。只影响当前工作；其他工作不会升级。已有工作记录会保留，相关批准需要重新确认。</p>
     <label className="field">目标发布版本<select value={targetId} onChange={e => setTargetId(e.target.value)}>
       <option value="">先在独立设计草稿中修改并由用户发布</option>
-      {s.versions.filter(v => v.templateId === base.templateId && v.id !== base.id).map(v => <option key={v.id}>{v.id}</option>)}
+      {s.versions.filter(v => v.templateId === base.templateId && v.id !== base.id).map((v, i) => <option key={v.id} value={v.id}>已发布版本 {i + 1}{v.releaseNotes ? ` · ${v.releaseNotes}` : ""}</option>)}
     </select></label>
-    <label className="field">必要性 / 原因<textarea value={reason} onChange={e => setReason(e.target.value)} /></label>
+    <label className="field">为什么要变更？<textarea value={reason} onChange={e => setReason(e.target.value)} /></label>
     {next && <>
-      <h3>影响节点（后端重新计算）</h3><p>{affected.join(", ") || "无执行定义变更"}</p>
-      <details open><summary>图 / 节点 / Gate / 提示词差异</summary>
-        <h4>旧 graph</h4><pre>{pretty(base.graph)}</pre><h4>新 graph</h4><pre>{pretty(next.graph)}</pre>
-        <h4>旧角色 / 提示词 / Skill / 模型 / 权限</h4><pre>{pretty(base.roles)}</pre><h4>新角色配置</h4><pre>{pretty(next.roles)}</pre>
-      </details>
-      <h3>保留 / 替代 / 删除映射（同 ID，增节点创建新尝试）</h3><pre>{pretty(mappings)}</pre>
-      <p>受影响任务：{s.tasks.filter(t => s.attempts.some(a => a.id === t.attemptId && a.runId === runId && affected.includes(a.nodeId))).map(t => `${t.id} (${t.status}, lease=${t.slotHeld})`).join("; ") || "尚未派工"}</p>
-      <p>需重新批准：{s.approvals.filter(p => p.runId === runId && p.valid && s.attempts.some(a => (a.id === p.attemptId || a.id === p.targetAttemptId) && affected.includes(a.nodeId))).map(p => p.id).join(", ") || "无有效批准"}</p>
+      <h3>变更影响预览</h3><p>{affected.length ? `有 ${affected.length} 个步骤受影响，后端会再次核对。` : "没有执行定义变更。"}</p>
+      <DefinitionChanges base={base} next={next} />
+      <p>受影响任务：{s.tasks.filter(t => s.attempts.some(a => a.id === t.attemptId && a.runId === runId && affected.includes(a.nodeId))).length} 项；需要重新确认的有效批准：{s.approvals.filter(p => p.runId === runId && p.valid && s.attempts.some(a => (a.id === p.attemptId || a.id === p.targetAttemptId) && affected.includes(a.nodeId))).length} 项。</p>
       <button disabled={pending || !reason.trim() || ["completed", "failed", "cancelled"].includes(run.status)} onClick={() => void mutate({ type: "patch.propose", payload: { patch: {
         id: `patch-${crypto.randomUUID()}`, runId, baseVersionId: base.id, proposedVersionId: next.id, reason,
         affectedNodeIds: affected, mappings, status: "proposed",
-      } } })}>记录提案（尚不应用）</button>
+      } } })}>记录应用提案（暂不应用）</button>
     </>}
     {s.patches.filter(p => p.runId === runId).map(p => <PatchProposal key={p.id} patch={p} snapshot={s} pending={pending} mutate={mutate} />)}
   </section>;

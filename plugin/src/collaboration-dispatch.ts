@@ -1,10 +1,11 @@
 import type { BackendScope, TeamflowSnapshot, TeamflowMessage } from "../../packages/protocol/src/index.js";
-import { audit, uid } from "./engine.js";
+import { advance, audit, uid } from "./engine.js";
 import { backendProcessIdentity, writerKey } from "./dispatch.js";
 import { bumpIO, conversationEligible, recoveryBlocks } from "./execution-fence.js";
 import { messageMayDeliver } from "./topic-policy.js";
 import { DispatchNotSentError, type OpenCodeAdapter } from "./opencode-adapter.js";
 import type { TeamflowStore } from "./store.js";
+import { blockingQuestion } from "./questions.js";
 
 export function senderLabel(s: TeamflowSnapshot, m: TeamflowMessage) {
   const kind = m.senderKind ?? (s.members.some(x => x.id === m.from) ? "agent" : ["user", "user-correction"].includes(m.from) ? "user" : "system");
@@ -15,7 +16,9 @@ export async function pumpCollaboration(d: {
   leader(): boolean; announce(s: TeamflowSnapshot): Promise<void>;
 }) {
   const { store, adapter, scope } = d;
-  for (const original of store.read(scope).messages) {
+  const snapshot = store.read(scope);
+  const answerIds = new Set(snapshot.questions.filter(q => q.status === "answered").map(q => q.answerMessageId));
+  for (const original of snapshot.messages) {
     if (!d.leader()) return;
     if (original.request && ["in_flight", "unknown"].includes(original.request.state) || original.admission === "pending") {
       const s = store.read(scope), task = s.tasks.find(t => t.memberId === original.to && t.runId === original.runId);
@@ -29,7 +32,7 @@ export async function pumpCollaboration(d: {
           if (m.request) m.request.state = "settled"; // native matching ID proves the single call already admitted
           m.admission = native.message === "queued" ? "observed_inbox" : "observed_context";
           if (!["cancelled", "acknowledged"].includes(m.status)) m.status = "delivered";
-          bumpIO(s.tasks.find(t => t.id === task.id)!); s.revision++;
+          bumpIO(s.tasks.find(t => t.id === task.id)!); advance(s); s.revision++;
           audit(s, "message.native_observed", { kind: "system" }, m.id);
           return structuredClone(s);
         });
@@ -38,7 +41,8 @@ export async function pumpCollaboration(d: {
       continue;
     }
     // Accepted is a durable native receipt. Observe for display/ack separately.
-    if (original.status === "delivered" && original.admission === "accepted") {
+    if (original.status === "delivered" && original.admission === "accepted" ||
+      answerIds.has(original.id) && ["delivered", "acknowledged"].includes(original.status) && original.admission === "observed_inbox") {
       try {
         const s = store.read(scope), t = s.tasks.find(t => t.memberId === original.to && t.runId === original.runId);
         if (!t?.sessionId) continue;
@@ -46,8 +50,12 @@ export async function pumpCollaboration(d: {
         if (n.message === "absent") continue;
         const updated = store.transact(scope, s => {
           const m = s.messages.find(m => m.id === original.id)!;
-          if (m.status !== "delivered") return;
-          m.admission = n.message === "queued" ? "observed_inbox" : "observed_context"; s.revision++;
+          if (!["delivered", "acknowledged"].includes(m.status) || m.admission === "observed_context") return;
+          const admission = n.message === "queued" ? "observed_inbox" : "observed_context";
+          if (m.admission === admission) return;
+          const freshTask = s.tasks.find(task => task.id === t.id && task.memberId === m.to && task.runId === m.runId);
+          if (!freshTask) return;
+          m.admission = admission; bumpIO(freshTask); advance(s); s.revision++;
           return structuredClone(s);
         });
         if (updated) await d.announce(updated);
@@ -80,11 +88,16 @@ export async function pumpCollaboration(d: {
       }
       if (recoveryBlocks(t) || store.pendingRequestForTask(scope, t.id)) return;
       const run = s.runs.find(r => r.id === t.runId)!;
+      const q = blockingQuestion(s, t);
+      // Wait for the original native turn's safe idle boundary before resuming
+      // it. Peer DMs cannot bypass a question or consume its reply's slot.
+      const answering = q?.status === "answered" && q.answerMessageId === m.id && q.memberId === t.memberId && q.taskId === t.id && m.taskId === t.id;
+      if (q && (!answering || t.slotHeld)) return;
       if (t.status === "submitted") t.executionMode = "conversation";
       if (!t.slotHeld) {
         if (s.tasks.filter(x => x.runId === t.runId && x.slotHeld).length >= run.config.activeSlots) return;
         if (t.writes && !store.acquire(writerKey(scope), t.id)) return;
-        t.slotHeld = true; t.executionMode = "conversation";
+        t.slotHeld = true; t.executionMode = answering ? "workflow" : "conversation";
       }
       if (t.writes && !store.owns(writerKey(scope), t.id)) throw new Error("Writer execution slot lost its directory lease; recover before continuation");
       t.owner = d.owner;

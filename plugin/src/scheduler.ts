@@ -8,6 +8,9 @@ import { pumpCollaboration } from "./collaboration-dispatch.js";
 import { reconcileExecutions } from "./execution-reconcile.js";
 import { bumpIO, recoveryBlocks } from "./execution-fence.js";
 import { patchBlocks, settlePatches } from "./patches.js";
+import { isDiscussion } from "./questions.js";
+import { teamConversationId } from "./templates/team-conversation.js";
+import { teamflowToolInstructions } from "./tool-contract.js";
 
 export { writerKey } from "./dispatch.js";
 // Shared by deferred selection and the final atomic native authorization.
@@ -212,16 +215,21 @@ export class Scheduler {
       const role = executionVersion.roles.find(r => r.id === (task.child?.role ?? n.role))!;
       const d = n.sourceNodeId ? sourceDelivery(updated, run, n) : undefined;
       const predecessors = executionVersion.graph.edges.filter(e => e.to === n.id && e.kind === "normal").map(e => current(updated, run.id, e.from));
-      const inputs = updated.deliveries.filter(d => predecessors.some(a => a?.id === d.attemptId));
+      const conversationTemplate = executionVersion.templateId === teamConversationId;
+      const discussion = isDiscussion(updated, a.id);
+      const proposal = conversationTemplate && !discussion ? current(updated, run.id, executionVersion.graph.entry) : undefined;
+      const inputs = updated.deliveries.filter(d => !d.staleBy && (d.attemptId === proposal?.id || predecessors.some(a => a?.id === d.attemptId)));
       const submission = n.kind === "work"
         ? { type: "task.submit", payload: { taskId: task.id, attemptId: a.id, artifactRevision: "<actual artifact version/hash>", criteriaRevision: a.criteriaRevision, artifacts: ["<real artifact path/ref>"], summary: "<actual results>", checks: [], unresolved: [] } }
         : { type: "review.submit", payload: { attemptId: a.id, targetAttemptId: d!.attemptId, deliveryId: d!.id, artifactRevision: d!.artifactRevision, criteriaRevision: d!.criteriaRevision, verdict: "pass|needs_revision|reject", issues: [], evidence: [] } };
       const brief = task.child ? [
         `Teamflow tracked auxiliary child. Run ${run.id}; member ${task.memberId}; logical parent ${task.child.parentMemberId}. Fresh independent session, NOT native parentID (unmetered auto-wake disabled).`,
         `Role ${role.id}: ${role.responsibility}\n${role.prompt}`,
+        teamflowToolInstructions,
         `Only relevant task input:\n${task.child.brief}`,
         `Read-only. Never use native subagent. Only teamflow_command member.spawn is tracked; max depth ${run.config.childDepth}. No user approval.`,
         `Basis ${task.child.criteriaRevision ?? a.criteriaRevision}: ${task.child.requirements ?? a.requirements ?? "original brief"}; topic=${task.child.topicId ?? "explicit unrelated work"}.`,
+        "If a business ambiguity materially affects your findings, use teamflow_command question.ask and end this turn. The user answer returns to this same session and does not approve anything.",
         `Finish via ${JSON.stringify({ type: "member.finish", payload: { taskId: task.id, summary: "<actual findings>" } })}. Parent result is returned through scheduler-admitted same-session continuation, never an unmetered native parent wake.`,
       ].join("\n\n") : [
         `Teamflow real product execution. Run ${run.id} (${run.label}); directory ${this.scope.projectDirectory}.`,
@@ -231,7 +239,11 @@ export class Scheduler {
 Registered peers (not transcripts): ${JSON.stringify(updated.members.filter(m => m.runId === run.id).map(m => ({ id: m.id, role: m.role })))}.`,
         `Rework context: ${a.reason ?? "initial attempt"}`,
         `Inputs: ${JSON.stringify(inputs)}\nSource delivery: ${JSON.stringify(d ?? null)}`,
+        teamflowToolInstructions,
+        ...(proposal ? ["The proposal in Inputs was approved by the user before this task was dispatched. Use its confirmedQuestions and acceptance criteria; do not silently change the scope."] : []),
+        ...(discussion ? ["This is a read-only discussion, not implementation. Ask a focused real user question with question.ask before drafting any submitted plan. Wait for a user reply in this session. Ask again if needed. Then summarize the verified answers, proposed scope, exclusions and acceptance in task.submit. Its delivery awaits a separate user decision."] : []),
         "Do not implement Teamflow itself. Native subagent is denied. Only teamflow_command member.spawn may create a registered read-only child when role/depth allow. Only do this run's task in its directory. No fake evidence or user approvals.",
+        `For genuine task uncertainty, call teamflow_command with ${JSON.stringify({ type: "question.ask", payload: { question: "<focused business question for the user>" } })}, then end the turn without submitting. For peer expertise use tracked team messages or agreed topics; never assume an unanswered requirement.`,
         "Use the actual teamflow_command tool to submit exactly once, then STOP all file writes and finish your response. A prose answer alone does not complete the task.",
         `Submission shape: ${JSON.stringify(submission)}`,
         "Checks/evidence items: {command:string,exitCode:integer,output:string,version:artifactRevision,source:'self_report' for work or 'independent_execution' for reviews/tests}. Test pass requires real executed evidence; review can pass with inspected artifact refs in summary/issues and optional commands. Never report an unexecuted command.",
@@ -248,7 +260,8 @@ Registered peers (not transcripts): ${JSON.stringify(updated.members.filter(m =>
         // No model starts until the actual session is durably bound.
         const receipt = (async () => {
           try {
-            const creation = this.adapter.createMember({ scope: this.scope, runId: run.id, memberId: task.memberId, parentMemberId: task.child?.parentMemberId, role: role.agent, brief, model: role.model, writes: task.writes, sessionId: task.dispatch!.sessionId, taskId: task.id, dispatchId: task.dispatchId });
+            const creation = this.adapter.createMember({ scope: this.scope, runId: run.id, memberId: task.memberId, parentMemberId: task.child?.parentMemberId, role: role.agent, brief, model: role.model, writes: task.writes,
+              discussionOnly: discussion, allowDefaultAgentFallback: conversationTemplate, sessionId: task.dispatch!.sessionId, taskId: task.id, dispatchId: task.dispatchId });
             await this.announce(starting);
             const session = await creation;
             await this.announce(this.commit(s => {
