@@ -3,8 +3,10 @@ import { z } from "zod";
 import { AgentCommandSchema, type BackendScope, type TeamflowService } from "../../packages/protocol/src/index.js";
 import { conversationEligible, recoveryBlocks } from "./execution-fence.js";
 import { sealedRound, visibleMessage } from "./topic-policy.js";
-import { blockingQuestion, isDiscussion } from "./questions.js";
-import { allowsDiscussionTool, TEAMFLOW_TOOL_NAMESPACE, teamflowToolInstructions } from "./tool-contract.js";
+import { blockingQuestion } from "./questions.js";
+import { stageCapabilities } from "./stage-capabilities.js";
+import { TEAMFLOW_TOOL_NAMESPACE, teamflowToolInstructions } from "./tool-contract.js";
+import { availableRouteTargets, enabledModels, mayPlanModels, sameModel } from "./model-routing.js";
 export interface PluginToolContext {
   scope: BackendScope;
   changed(revision: number): Promise<void>;
@@ -16,7 +18,7 @@ export interface PluginToolContext {
 export function registerTeamflowTools(context: PluginToolContext, service: TeamflowService): void {
   const { scope, changed } = context;
   context.register({
-    name: "command", description: "Tracked Teamflow submissions and collaboration. Use question.ask with {question} to ask the actual user a business question, then finish the turn and wait. Identity comes from this real session. No user answers, approval, publish, patch.apply or correction.apply.",
+    name: "command", description: "Tracked Teamflow submissions and collaboration. Use question.ask with {question, options?} for a blocking business question. Prefer 2–4 meaningful choices where appropriate; the user can also write an answer. Then finish the turn and wait. model.plan is only for the run's current coordinator to save a candidate and reason for an unclaimed stage or attempt. No user answers, approval, publish, patch.apply or correction.apply.",
     input: AgentCommandSchema,
     execute: async (command, tool) => {
       const snapshot = await service.snapshot(scope);
@@ -37,6 +39,7 @@ export function registerTeamflowTools(context: PluginToolContext, service: Teamf
         const question = result.snapshot.questions.findLast(q => q.memberId === self?.id && q.status === "open");
         return { content: `问题已向用户发出（${question?.id ?? "已记录"}）：${command.payload.question}\n请结束本轮，不要继续派工、改文件或提交。用户回答后会回到本会话；回答不是批准。` };
       }
+      if (command.type === "model.plan") return { content: "Model plan recorded for future dispatch. No work was started, no model was changed in an existing session, and no approval was granted." };
       return { content: JSON.stringify({ revision: result.revision, resyncRequired: result.resyncRequired,
         instruction: ["task.submit", "review.submit", "member.finish"].includes(command.type)
           ? "Submission committed. Stop writes and finish. Gate approval remains separate."
@@ -47,33 +50,45 @@ export function registerTeamflowTools(context: PluginToolContext, service: Teamf
   });
 }
 export async function registerTools(ctx: Plugin.Context, scope: BackendScope, service: TeamflowService, changed: (revision: number) => Promise<void>) {
-  const discussionSession = (s: Awaited<ReturnType<TeamflowService["snapshot"]>>, sessionId: string) => {
-    const member = s.members.find(m => m.sessionId === sessionId);
-    const t = member && s.tasks.find(t => t.id === member.taskId);
-    return !!t && isDiscussion(s, t.attemptId);
-  };
-  await ctx.session.hook("context", async event => {
-    const s = await service.snapshot(scope);
-    if (discussionSession(s, event.sessionID)) {
-      for (const name of Object.keys(event.tools)) if (!allowsDiscussionTool(name)) delete event.tools[name];
-    }
-    if (s.members.some(m => m.sessionId === event.sessionID) || s.runs.some(r => r.entry?.sessionId === event.sessionID) ||
-        s.drafts.some(d => d.designer?.sessionId === event.sessionID)) {
-      event.system.push({ type: "text", text: teamflowToolInstructions });
-    }
-  });
+  for (const kind of ["context", "compaction", "generate"] as const) {
+    await ctx.session.hook(kind, async event => {
+      const s = await service.snapshot(scope);
+      const policy = stageCapabilities(s, event.sessionID);
+      if (policy) for (const name of Object.keys(event.tools)) if (!policy.allowsTool(name)) delete event.tools[name];
+      if (kind === "context" && (policy || s.runs.some(r => r.entry?.sessionId === event.sessionID) ||
+          s.drafts.some(d => d.designer?.sessionId === event.sessionID))) {
+        event.system.push({ type: "text", text: teamflowToolInstructions });
+      }
+    });
+  }
   await ctx.tool.hook("execute.before", async event => {
-    if (!allowsDiscussionTool(event.tool) && discussionSession(await service.snapshot(scope), event.sessionID)) {
-      throw new Error("需求讨论只允许读取资料和使用 Teamflow 对话工具；禁止改文件、shell、委派及外部工具");
+    const s = await service.snapshot(scope);
+    const policy = stageCapabilities(s, event.sessionID);
+    if (!policy) return;
+    if (!policy.allowsTool(event.tool)) throw new Error(`Tool ${event.tool} is unavailable for this Teamflow stage and role`);
+    const task = s.tasks.find(t => t.sessionId === event.sessionID);
+    if (task && (task.child?.staleBy || ["cancelled", "superseded"].includes(task.status) ||
+      s.runs.some(run => run.id === task.runId && ["cancelled", "failed"].includes(run.status)))) {
+      throw new Error("This Teamflow execution is no longer current");
+    }
+    if (event.tool === "question") {
+      if (!task || !task.slotHeld || task.status !== "running" || task.executionMode === "conversation" ||
+        !conversationEligible(s, task) || recoveryBlocks(task) || blockingQuestion(s, task)) {
+        throw new Error("Native form requires a current executing member with no Teamflow business question pending");
+      }
     }
   });
-  // The Code Mode fetch extension bypasses tool hooks and asserts the native
-  // "webfetch" action directly. Also protect already-created discussion sessions.
+  // Code Mode fetch bypasses tool hooks and asserts webfetch directly.
+  // Never change a host deny/ask into allow.
   await ctx.permission.hook("evaluate", async event => {
-    if (!allowsDiscussionTool(event.action) && discussionSession(await service.snapshot(scope), event.sessionID)) {
-      event.effect = "deny";
-      event.message = "需求讨论只读：禁止改文件、shell、委派及外部请求";
-    }
+    if (event.effect === "deny") return;
+    const policy = stageCapabilities(await service.snapshot(scope), event.sessionID);
+    if (!policy || policy.allowsAction(event.action, event.resources)) return;
+    const nativeActions = ["edit", "shell", "subagent", "skill", "read", "glob", "grep", "webfetch", "websearch", "question"];
+    if (!nativeActions.includes(event.action) && (await ctx.tool.list()).some(tool =>
+      tool.options?.permission === event.action && policy.allowsTool(tool.id))) return;
+    event.effect = "deny";
+    event.message = `Permission ${event.action} is unavailable for this Teamflow stage and role`;
   });
   await ctx.tool.transform(editor => {
     editor.namespace({ name: TEAMFLOW_TOOL_NAMESPACE, description: "Teamflow run context, member questions, and tracked workflow commands" });
@@ -108,8 +123,24 @@ export async function registerTools(ctx: Plugin.Context, scope: BackendScope, se
           self: m, taskId: task.id, status: task.status,
           instruction: "Teamflow is paused. Finish the already admitted turn only. Submit its actual result with the original task.submit, review.submit or member.finish as instructed, or acknowledge a message already delivered to this turn. No new work, spawn, discussion or Gate action. This receipt does not start another turn.",
         }) };
+        const run = s.runs.find(run => run.id === m.runId);
+        let modelRouting;
+        if (run && mayPlanModels(s, run, context.sessionID)) {
+          const candidates = run.modelRouting?.candidates ?? [];
+          const catalog = candidates.length ? await enabledModels(ctx).catch(() => undefined) : [];
+          modelRouting = {
+            runId: run.id,
+            candidates: candidates.map(c => ({ ...c, enabled: catalog?.some(row => sameModel(row.model, c.model)) ?? null })),
+            targets: availableRouteTargets(s, run),
+            plans: run.modelRouting?.plans ?? [],
+            instruction: candidates.length
+              ? 'Choose an enabled candidate using task difficulty and specialties in tags/purpose. Save relevant unclaimed stages (when stageChoiceAvailable) or exact attempts with model.plan {runId,target:{kind:"stage"|"attempt",id},versionId,choice:{model:{providerID,id},reason}}; copy the target versionId, explain the tradeoff, leave unnecessary choices unset. No permissions, Gate or existing session changes.'
+              : "No user-approved model candidates; leave the existing defaults. The user can configure the pool in the web run.",
+          };
+        }
         return { content: JSON.stringify({
           revision: s.revision, self: m, task: s.tasks.find(t => t.id === m.taskId),
+          modelRouting,
           peers: s.members.filter(p => p.runId === m.runId),
           questions: s.questions.filter(q => q.taskId === task.id).map(q => q.status === "answered" && blockingQuestion(s, task)?.id === q.id ? { ...q, answer: undefined } : q),
           messages: s.messages.filter(x => x.runId === m.runId && (x.to === m.id || x.from === m.id)).map(x => visibleMessage(s, x, m.id) ? { ...x, request: undefined } : {

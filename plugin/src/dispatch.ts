@@ -128,7 +128,7 @@ export async function reconcileDispatch(deps: {
         if (deliveryPending || task.dispatch?.delivery === "failed" || task.dispatch?.delivery === "admitted") throw new Error("Unconfirmed/previous admission cannot be resent; need native matching dispatch or settled no-send evidence");
         if (!task.dispatch?.brief || !["not_started", "not_sent"].includes(task.dispatch.delivery)) throw new Error("No durable unissued delivery/brief; legacy unknown admission needs further evidence");
         if (observation.busy || observation.inboxIds.length) throw new Error("Native session already busy/queued without this dispatch; cannot bind as unstarted");
-        await adapter.prepareBound(observation.sessionId, task.dispatch.brief);
+        await adapter.prepareBound(observation.sessionId, task.dispatch.brief, task.dispatch.modelPlan?.model);
         state = "ready"; // Scheduler may issue the original never-sent intent once.
       }
     } else {

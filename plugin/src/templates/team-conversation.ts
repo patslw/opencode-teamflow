@@ -1,4 +1,4 @@
-import type { WorkflowRole } from "../../../packages/protocol/src/index.js";
+import type { WorkflowGraph, WorkflowRole } from "../../../packages/protocol/src/index.js";
 import { node } from "./bug-fix.js";
 
 export const teamConversationId = "team-conversation";
@@ -26,4 +26,16 @@ export const teamConversation = {
       [proposalGateId, "proposal", "return"], ["review", "demo", "return"], ["accept", "demo", "return"],
     ].map(([from, to, kind]) => ({ from, to, kind: kind as "normal" | "return" })),
   },
+};
+
+export const teamConversationGraphV2: WorkflowGraph = {
+  ...teamConversation.graph,
+  nodes: teamConversation.graph.nodes.map(n => n.id === "proposal" ? {
+    ...n, skills: ["teamflow-collaboration"], tools: ["read", "glob", "grep", "skill", "question"],
+    prompt: "先用 question.ask 澄清一个会改变方案的关键问题，有实际取舍时给出 2–4 个选项，用户也可自填。结束本轮，收到真实回复后仍有不明确的就继续问。通过 task.submit 提交已确认事项、范围和验收方式，artifacts 可引用「本会话方案」。原生 question 仅收集当轮意见，不代替业务澄清或方案批准。不写代码、不运行 shell、不委派。",
+  } : n.id === "demo" ? {
+    ...n, tools: ["read", "glob", "grep", "skill", "question", "edit", "write", "patch", "shell"],
+  } : n.id === "review" ? {
+    ...n, tools: ["read", "glob", "grep", "skill", "question"],
+  } : n),
 };

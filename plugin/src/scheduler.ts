@@ -11,6 +11,8 @@ import { patchBlocks, settlePatches } from "./patches.js";
 import { isDiscussion } from "./questions.js";
 import { teamConversationId } from "./templates/team-conversation.js";
 import { teamflowToolInstructions } from "./tool-contract.js";
+import { taskCapabilities } from "./stage-capabilities.js";
+import { plannedModel } from "./model-routing.js";
 
 export { writerKey } from "./dispatch.js";
 // Shared by deferred selection and the final atomic native authorization.
@@ -193,11 +195,14 @@ export class Scheduler {
           }
           for (const a of s.attempts.filter(a => run.status === "running" && a.runId === run.id && a.status === "ready")) {
             if (patchBlocks(s, run.id, a.nodeId)) continue;
-            const n = attemptVersion(s, a).graph.nodes.find(n => n.id === a.nodeId)!;
+             const version = attemptVersion(s, a);
+             const n = version.graph.nodes.find(n => n.id === a.nodeId)!;
+             const modelPlan = version.roles.find(r => r.id === n.role)?.model ? undefined : plannedModel(run, a, version.id);
             const taskId = uid();
             if (n.writes && !this.store.acquire(writerKey(this.scope), taskId)) continue;
             claimed = { id: taskId, runId: run.id, attemptId: a.id, memberId: `member-${uid()}`, writes: n.writes, status: "intent", dispatchId: `msg_${uid().replaceAll("-", "")}`, slotHeld: true, owner: this.owner, createdAt: now(),
-              dispatch: { sessionId: `ses_${uid().replaceAll("-", "")}`, brief: "", role: n.role!, create: "not_started", delivery: "not_started", process: backendProcessIdentity } };
+               dispatch: { sessionId: `ses_${uid().replaceAll("-", "")}`, brief: "", role: n.role!, create: "not_started", delivery: "not_started", process: backendProcessIdentity,
+                 ...(modelPlan ? { modelPlan: structuredClone(modelPlan) } : {}) } };
             s.tasks.push(claimed); a.status = "running";
             s.revision++; audit(s, "dispatch.intent", { kind: "system" }, `${claimed.id} attempt=${a.id}`);
             return structuredClone(s);
@@ -234,16 +239,17 @@ export class Scheduler {
       ].join("\n\n") : [
         `Teamflow real product execution. Run ${run.id} (${run.label}); directory ${this.scope.projectDirectory}.`,
         `User task: ${run.brief}`, `Role ${role.id}: ${role.responsibility}\n${role.prompt}`, `Node ${n.id}; mode=${n.mode}; writes=${n.writes}; ${n.prompt}`,
-        `Criteria ${a.criteriaRevision}: ${n.criteria.join("; ")}. Skills: ${role.skills.join(", ") || "none"}.`,
+        `Criteria ${a.criteriaRevision}: ${n.criteria.join("; ")}.`,
         `Current requirements: ${a.requirements ?? "original node criteria"}.
 Registered peers (not transcripts): ${JSON.stringify(updated.members.filter(m => m.runId === run.id).map(m => ({ id: m.id, role: m.role })))}.`,
         `Rework context: ${a.reason ?? "initial attempt"}`,
         `Inputs: ${JSON.stringify(inputs)}\nSource delivery: ${JSON.stringify(d ?? null)}`,
         teamflowToolInstructions,
+        ...(!task.writes && role.id === "coordinator" ? ["For future unclaimed workflow tasks, check teamflow_context for the user's candidate models and targets. If candidates exist, use model.plan to record choices by actual difficulty and specialty, and explain why; a model choice is not dispatch, permission, or approval."] : []),
         ...(proposal ? ["The proposal in Inputs was approved by the user before this task was dispatched. Use its confirmedQuestions and acceptance criteria; do not silently change the scope."] : []),
-        ...(discussion ? ["This is a read-only discussion, not implementation. Ask a focused real user question with question.ask before drafting any submitted plan. Wait for a user reply in this session. Ask again if needed. Then summarize the verified answers, proposed scope, exclusions and acceptance in task.submit. Its delivery awaits a separate user decision."] : []),
-        "Do not implement Teamflow itself. Native subagent is denied. Only teamflow_command member.spawn may create a registered read-only child when role/depth allow. Only do this run's task in its directory. No fake evidence or user approvals.",
-        `For genuine task uncertainty, call teamflow_command with ${JSON.stringify({ type: "question.ask", payload: { question: "<focused business question for the user>" } })}, then end the turn without submitting. For peer expertise use tracked team messages or agreed topics; never assume an unanswered requirement.`,
+        ...(discussion ? ["This is a read-only discussion, not implementation. Do not delegate. Ask a focused real user question with question.ask before drafting any submitted plan. Provide 2–4 meaningful options when possible. Wait for a user reply in this session. Ask again if needed. Then summarize the verified answers, proposed scope, exclusions and acceptance in task.submit. Its delivery awaits a separate user decision."] : ["Only teamflow_command member.spawn may create a registered read-only child when role/depth allow."]),
+        "Do not implement Teamflow itself. Native subagent is denied. Only do this run's task in its directory. No fake evidence or user approvals.",
+        "For genuine task uncertainty, use the tracked Teamflow question and end the turn without submitting. For peer expertise use tracked team messages or agreed topics; never assume an unanswered requirement.",
         "Use the actual teamflow_command tool to submit exactly once, then STOP all file writes and finish your response. A prose answer alone does not complete the task.",
         `Submission shape: ${JSON.stringify(submission)}`,
         "Checks/evidence items: {command:string,exitCode:integer,output:string,version:artifactRevision,source:'self_report' for work or 'independent_execution' for reviews/tests}. Test pass requires real executed evidence; review can pass with inspected artifact refs in summary/issues and optional commands. Never report an unexecuted command.",
@@ -260,13 +266,17 @@ Registered peers (not transcripts): ${JSON.stringify(updated.members.filter(m =>
         // No model starts until the actual session is durably bound.
         const receipt = (async () => {
           try {
-            const creation = this.adapter.createMember({ scope: this.scope, runId: run.id, memberId: task.memberId, parentMemberId: task.child?.parentMemberId, role: role.agent, brief, model: role.model, writes: task.writes,
-              discussionOnly: discussion, allowDefaultAgentFallback: conversationTemplate, sessionId: task.dispatch!.sessionId, taskId: task.id, dispatchId: task.dispatchId });
+             const modelPlan = task.dispatch?.modelPlan;
+             const creation = this.adapter.createMember({ scope: this.scope, runId: run.id, memberId: task.memberId, parentMemberId: task.child?.parentMemberId, role: role.agent, brief, model: role.model ?? modelPlan?.model,
+               requireExactModel: !!modelPlan, writes: task.writes,
+              allowDefaultAgentFallback: conversationTemplate, sessionId: task.dispatch!.sessionId, taskId: task.id, dispatchId: task.dispatchId },
+            taskCapabilities(updated, task));
             await this.announce(starting);
             const session = await creation;
             await this.announce(this.commit(s => {
               const t = s.tasks.find(t => t.id === task.id)!;
-              bindNativeSession(s, t, session.sessionId); t.dispatch!.create = "succeeded";
+               bindNativeSession(s, t, session.sessionId); t.dispatch!.create = "succeeded";
+               if (session.model) t.dispatch!.nativeModel = session.model;
               if (this.hasLeadership() && t.owner === this.owner && t.status === "intent") t.status = "bound";
               audit(s, "dispatch.bound", { kind: "system" }, `${task.id} session=${session.sessionId} returningOwner=${this.owner} currentOwner=${t.owner}`);
             }, false));

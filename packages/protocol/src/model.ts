@@ -4,9 +4,32 @@ const id = z.string().min(1);
 export const BackendScopeSchema = z.object({ backendId: id, projectDirectory: id }).strict();
 export type BackendScope = z.infer<typeof BackendScopeSchema>;
 export type ActorContext = { kind: "user" } | { kind: "agent"; sessionId: string } | { kind: "system" };
+export const ModelRefSchema = z.object({ providerID: id, id }).strict();
+export const ModelCandidateSchema = z.object({
+  model: ModelRefSchema, tags: z.array(z.string().trim().min(1).max(60)).max(12),
+  purpose: z.string().trim().max(500),
+}).strict();
+export const ModelCatalogEntrySchema = z.object({
+  model: ModelRefSchema, name: id, example: ModelCandidateSchema.omit({ model: true }).optional(),
+}).strict();
+export const ModelTargetSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("stage"), id }).strict(),
+  z.object({ kind: z.literal("attempt"), id }).strict(),
+]);
+export const ModelChoiceSchema = z.object({
+  model: ModelRefSchema, reason: z.string().trim().min(1).max(1000),
+}).strict();
+const ModelPlanSchema = ModelChoiceSchema.extend({
+  target: ModelTargetSchema, versionId: id, source: z.enum(["user", "coordinator"]),
+});
+export type ModelRef = z.infer<typeof ModelRefSchema>;
+export type ModelCatalogEntry = z.infer<typeof ModelCatalogEntrySchema>;
+export type ModelCandidate = z.infer<typeof ModelCandidateSchema>;
+export type ModelTarget = z.infer<typeof ModelTargetSchema>;
+export type ModelPlan = z.infer<typeof ModelPlanSchema>;
 export const RoleSchema = z.object({
   id, agent: id, responsibility: id, prompt: id, skills: z.array(id),
-  model: z.object({ providerID: id, id }).strict().optional(),
+  model: ModelRefSchema.optional(),
   permissions: z.array(id), childRoles: z.array(id), maxDepth: z.number().int().min(0).max(2),
 }).strict();
 export const NodeSchema = z.object({
@@ -14,6 +37,7 @@ export const NodeSchema = z.object({
   role: id.optional(), mode: z.enum(["demo", "formal", "analysis"]), prompt: id,
   inputs: z.array(id), deliverables: z.array(id), criteria: z.array(id), criteriaRevision: id,
   writes: z.boolean(), sourceNodeId: id.optional(),
+  skills: z.array(id).optional(), tools: z.array(id).optional(),
   gate: z.object({ user: z.boolean(), reviewRoles: z.array(id), testRoles: z.array(id) }).strict().optional(),
 }).strict();
 export const EdgeSchema = z.object({ from: id, to: id, kind: z.enum(["normal", "return"]) }).strict();
@@ -27,6 +51,7 @@ export const RunSchema = z.object({
   id, versionId: id, label: id, brief: id, status: z.enum(["running", "waiting", "paused", "completed", "failed", "cancelled"]),
   config: z.object({ activeSlots: z.number().int().min(1).max(16), childDepth: z.number().int().min(0).max(2), reworkAttempts: z.number().int().min(0).max(10) }).strict(),
   createdAt: id, waitingReason: z.string().optional(),
+  modelRouting: z.object({ candidates: z.array(ModelCandidateSchema), plans: z.array(ModelPlanSchema) }).strict().optional(),
   entry: z.object({
     sessionId: id,
     source: z.enum(["existing", "teamflow"]),
@@ -67,6 +92,8 @@ export const TaskSchema = z.object({
   inspection: z.object({ requestId: id, state: z.enum(["checking", "observed", "blocked"]), evidence: z.array(z.string()) }).strict().optional(),
   dispatch: z.object({
     sessionId: id, brief: z.string(), role: id,
+    modelPlan: ModelPlanSchema.optional(),
+    nativeModel: ModelRefSchema.optional(),
     process: id.optional(),
     create: z.enum(["not_started", "pending", "succeeded", "failed", "not_sent"]),
     delivery: z.enum(["not_started", "pending", "admitted", "failed", "not_sent", "terminated"]),
@@ -81,9 +108,11 @@ export const EvidenceSchema = z.object({
   command: id, exitCode: z.number().int(), output: z.string(), version: id,
   source: z.enum(["self_report", "independent_execution"]),
 }).strict();
+export const QuestionOptionsSchema = z.array(z.string().trim().min(1).max(500)).max(4)
+  .refine(options => new Set(options).size === options.length, "Question options must be distinct");
 export const QuestionSchema = z.object({
   id, runId: id, memberId: id, attemptId: id, taskId: id,
-  question: id, answer: id.optional(), answerMessageId: id.optional(),
+  question: id, options: QuestionOptionsSchema.optional(), answer: id.optional(), answerMessageId: id.optional(),
   status: z.enum(["open", "answered", "superseded"]),
   createdAt: id, answeredAt: id.optional(), supersededAt: id.optional(),
 }).strict();
@@ -101,6 +130,7 @@ export const ApprovalSchema = z.object({
 }).strict();
 export const MessageSchema = z.object({
   id, runId: id, from: id, to: id, text: id,
+  purpose: z.literal("proposal_discussion").optional(),
   senderKind: z.enum(["user", "agent", "system"]).optional(),
   continuationAuthorized: z.boolean().optional(),
   status: z.enum(["intent", "delivered", "acknowledged", "uncertain", "cancelled", "undelivered"]),

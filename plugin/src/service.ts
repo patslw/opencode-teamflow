@@ -13,6 +13,8 @@ import { patchCommand, settlePatches } from "./patches.js";
 import { activeEscalation, preserveLegacyEscalation } from "./escalation.js";
 import { blockingQuestion, questionCommand } from "./questions.js";
 import { bumpIO } from "./execution-fence.js";
+import { applyModelRouting, routingRun, sameModel } from "./model-routing.js";
+import type { ModelRef } from "../../packages/protocol/src/index.js";
 
 export function createTeamflowService({ store, adapter }: { store: TeamflowStore; adapter: OpenCodeAdapter }): TeamflowService & { assertSession(scope: BackendScope, sessionId: string): Promise<void> } {
   return {
@@ -47,7 +49,7 @@ export function createTeamflowService({ store, adapter }: { store: TeamflowStore
         await adapter.getSession(d.designer.sessionId);
       }
       let observedAnswer: string | undefined;
-      if (actor.kind === "agent" && ["question.ask", "task.submit", "review.submit", "member.finish", "member.spawn", "message.ack"].includes(envelope.command.type)) {
+      if (actor.kind === "agent" && ["question.ask", "task.submit", "review.submit", "member.finish", "member.spawn", "message.ack", "model.plan"].includes(envelope.command.type)) {
         const s = store.read(envelope.scope);
         const prior = existingRequestResult(store, s, envelope.requestId, fingerprint);
         if (prior) return prior;
@@ -56,6 +58,17 @@ export function createTeamflowService({ store, adapter }: { store: TeamflowStore
         const m = s.messages.find(m => m.id === answer);
         if (m?.request && ["in_flight", "unknown", "settled"].includes(m.request.state) &&
           await adapter.hasObservedMessage(actor.sessionId, m.id, m.request)) observedAnswer = m.id;
+      }
+      let enabled: ModelRef[] = [];
+      const command = envelope.command;
+      if (command.type === "model.plan" || command.type === "model.candidates") {
+        const s = store.read(envelope.scope);
+        const prior = existingRequestResult(store, s, envelope.requestId, fingerprint);
+        if (prior) return prior;
+        const run = routingRun(s, command, actor);
+        if (command.type === "model.plan" || command.payload.candidates.some(c => !run.modelRouting?.candidates.some(old => sameModel(old.model, c.model)))) {
+          enabled = (await adapter.listModels()).map(x => x.model);
+        }
       }
       return store.transact(envelope.scope, s => {
         const prior = existingRequestResult(store, s, envelope.requestId, fingerprint);
@@ -117,6 +130,8 @@ export function createTeamflowService({ store, adapter }: { store: TeamflowStore
             executeSubmission(s, c, actor); break;
           case "question.ask": case "question.answer":
             questionCommand(s, c, actor); break;
+          case "model.plan": case "model.candidates": case "model.clear":
+            applyModelRouting(s, c, actor, enabled); break;
           case "template.import": {
             if (actor.kind !== "user") throw new Error("Only user may import published templates");
             const { template, version } = c.payload;

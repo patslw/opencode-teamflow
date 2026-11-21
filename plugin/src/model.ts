@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { VersionSchema, type WorkflowVersion } from "../../packages/protocol/src/index.js";
 import { bugFix } from "./templates/bug-fix.js";
 import { requireDevelopment } from "./templates/require-development.js";
-import { proposalGateId, teamConversation, teamConversationId } from "./templates/team-conversation.js";
+import { proposalGateId, teamConversation, teamConversationGraphV2, teamConversationId } from "./templates/team-conversation.js";
 const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical) : value !== null && typeof value === "object" ? Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, canonical(v)])) : value;
 export const digestVersion = (v: Pick<WorkflowVersion, "templateId" | "graph" | "roles">) => createHash("sha256").update(JSON.stringify(canonical({ templateId: v.templateId, graph: v.graph, roles: v.roles }))).digest("hex");
 export function validateVersion(input: WorkflowVersion) {
@@ -66,8 +66,17 @@ export function validateVersion(input: WorkflowVersion) {
   }
   return v;
 }
-export const builtins = [bugFix, requireDevelopment, teamConversation].map(({ template, graph, roles }) => {
+function builtin({ template, graph, roles }: typeof teamConversation | {
+  template: typeof teamConversation.template; graph: WorkflowVersion["graph"]; roles: WorkflowVersion["roles"];
+}, versionNumber = 1) {
   const content = { templateId: template.id, graph, roles };
-  const version = validateVersion({ ...content, id: `${template.id}@1`, releaseNotes: "Built-in demo v1", digest: digestVersion(content), publishedAt: "2026-11-16T00:00:00.000Z" });
+  const version = validateVersion({ ...content, id: `${template.id}@${versionNumber}`,
+    ...(versionNumber === 1 ? { releaseNotes: "Built-in demo v1", publishedAt: "2026-11-16T00:00:00.000Z" }
+      : { parentVersionId: `${template.id}@1`, releaseNotes: "阶段能力与提问选项", publishedAt: "2026-11-21T00:00:00.000Z" }),
+    digest: digestVersion(content) });
   return { template, version };
-});
+}
+export const builtins = [
+  ...[bugFix, requireDevelopment, teamConversation].map(preset => builtin(preset)),
+  builtin({ ...teamConversation, graph: teamConversationGraphV2 }, 2),
+];

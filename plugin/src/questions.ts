@@ -41,7 +41,7 @@ export function questionCommand(s: TeamflowSnapshot, c: Extract<TeamflowCommand,
     }
     assertQuestionResolved(s, t);
     const q: TeamflowQuestion = { id: uid(), runId: t.runId, memberId: t.memberId, attemptId: t.attemptId, taskId: t.id,
-      question: c.payload.question, status: "open", createdAt: now() };
+      question: c.payload.question, ...(c.payload.options?.length ? { options: c.payload.options } : {}), status: "open", createdAt: now() };
     s.questions.push(q);
     bumpIO(t); // Invalidate an idle observation made before this turn asked.
     return;

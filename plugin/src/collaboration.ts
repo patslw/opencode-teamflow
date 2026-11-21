@@ -104,6 +104,30 @@ export function collaborate(s: TeamflowSnapshot, c: TeamflowCommand, actor: Acto
     }
     case "message.send": {
       const p = c.payload; correctableRun(s, p.runId);
+      if (p.purpose) {
+        if (actor.kind !== "user") throw new Error("Only trusted user may start proposal discussion");
+        const run = liveRun(s, p.runId);
+        const member = s.members.find(m => m.id === p.toMemberId && m.runId === run.id);
+        const task = member && s.tasks.find(t => t.id === member.taskId && t.runId === run.id && t.memberId === member.id);
+        const source = task && s.attempts.find(a => a.id === task.attemptId && a.runId === run.id);
+        const delivery = source && s.deliveries.findLast(d => d.runId === run.id && d.attemptId === source.id);
+        const gate = versionFor(s, run).graph.nodes.find(n => {
+          const a = current(s, run.id, n.id);
+          return n.kind === "gate" && n.gate?.user && n.sourceNodeId === source?.nodeId &&
+            a?.status === "awaiting_gate" && !a.supersededBy && a.criteriaRevision === delivery?.criteriaRevision &&
+            attemptVersion(s, a)?.graph.nodes.some(x => x.id === n.id && x.kind === "gate" && x.gate?.user && x.sourceNodeId === source?.nodeId);
+        });
+        if (!member || member.legacy || !task || task.child || task.status !== "submitted" || !source ||
+          source.status !== "passed" || source.supersededBy || current(s, run.id, source.nodeId)?.id !== source.id ||
+          !delivery || delivery.staleBy || delivery.memberId !== member.id || delivery.sessionId !== member.sessionId ||
+          task.sessionId !== member.sessionId || delivery.criteriaRevision !== source.criteriaRevision ||
+          attemptVersion(s, source)?.graph.nodes.find(n => n.id === source.nodeId)?.role !== member.role ||
+          !gate || !conversationEligible(s, task, true)) throw new Error("Proposal discussion requires the current user Gate's original source delivery and author session");
+        if (p.topicId || p.relayMessageId) throw new Error("Proposal discussion cannot be routed through a topic or relay");
+        const association = associationFor(s, run.id, "user", member.id, p);
+        enqueue(s, run.id, "user", member.id, p.text, { ...association, purpose: p.purpose });
+        break;
+      }
       const from = sender(s, actor, p.runId);
       if (!s.members.some(m => m.id === p.toMemberId && m.runId === p.runId)) throw new Error("Recipient is not in this run");
       communication(s, p.runId, from, p.toMemberId, p.text, p); break;

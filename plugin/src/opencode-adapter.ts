@@ -4,7 +4,10 @@ import { Service } from "@opencode/client/service";
 import { readFile } from "node:fs/promises";
 import { z } from "zod";
 import type { BackendScope, MemberDelivery, MemberLaunch, MemberSession, Run, Task, TeamflowMessage } from "../../packages/protocol/src/index.js";
-import { discussionPermissions, teamflowToolInstructions } from "./tool-contract.js";
+import { teamflowToolInstructions } from "./tool-contract.js";
+import { deniedActions, type taskCapabilities } from "./stage-capabilities.js";
+import type { SessionFormReplyInput } from "@opencode/client";
+import { enabledModels, sameModel } from "./model-routing.js";
 
 export class DispatchNotSentError extends Error {}
 export interface DispatchInspection {
@@ -46,6 +49,7 @@ export class OpenCodeAdapter {
     const selected = (await this.ctx.agent.get({ agentID: role })).data.model;
     return selected ? { providerID: selected.providerID, id: selected.id } : undefined;
   }
+  listModels() { return enabledModels(this.ctx); }
 
   async ensureRunEntry(scope: BackendScope, run: Run & { entry: NonNullable<Run["entry"]> }) {
     const id = run.entry.sessionId;
@@ -73,22 +77,37 @@ export class OpenCodeAdapter {
     });
   }
 
-  async createMember(launch: MemberLaunch): Promise<MemberSession> {
+  async createMember(launch: MemberLaunch, policy?: ReturnType<typeof taskCapabilities>): Promise<MemberSession> {
     const parentID = launch.parentMemberId ? this.parentSession(launch.parentMemberId) : undefined;
     if (launch.parentMemberId && !parentID) throw new Error("Unknown parent member");
     let model: MemberLaunch["model"];
     let agent = launch.role;
     let client: OpenCodeClient;
+    let disabledActions: string[] = [];
+    let skillInstruction: string | undefined;
     try {
       client = await this.nativeClient();
       if (launch.allowDefaultAgentFallback && !(await this.ctx.agent.list()).data.some(candidate => candidate.id === agent)) agent = "build";
       const configured = (await this.ctx.agent.get({ agentID: agent })).data.model;
-      const available = launch.model || (launch.allowDefaultAgentFallback && configured) ? (await this.ctx.model.list()).data : undefined;
-      const enabled = (ref: NonNullable<typeof configured>) => available?.some(m => m.enabled && m.providerID === ref.providerID && m.id === ref.id);
-      if (launch.model && !enabled(launch.model)) throw new Error("Configured role model is not available on this backend");
+      const available = launch.model || (launch.allowDefaultAgentFallback && configured) ? await this.listModels() : undefined;
+      const enabled = (ref: NonNullable<typeof configured>) => available?.some(m => sameModel(m.model, ref));
+      if (launch.model && !enabled(launch.model)) throw new Error(`Selected model ${launch.model.providerID}/${launch.model.id} is not enabled on this backend; no fallback or native session creation`);
       const selected = launch.model ?? (launch.allowDefaultAgentFallback && configured && enabled(configured) ? configured : (await this.ctx.model.default()).data);
       if (!selected) throw new Error("No default model available");
       model = { providerID: selected.providerID, id: selected.id };
+      if (policy) {
+        disabledActions = await deniedActions(this.ctx, policy);
+        if (policy.skills.length) {
+          const installed = new Set((await this.ctx.skill.list()).data.map(skill => skill.id));
+          const selected = [...new Set(policy.skills)];
+          const available = selected.filter(id => installed.has(id));
+          const missing = selected.filter(id => !installed.has(id));
+          skillInstruction = [
+            available.length && `OpenCode skills selected for this stage and installed here: ${JSON.stringify(available)}. Use the native skill tool by exact ID to load the actual instructions when relevant; respect permission prompts or denials.`,
+            missing.length && `Configured skills not installed in this location: ${JSON.stringify(missing)}. Do not claim to have loaded them.`,
+          ].filter(Boolean).join("\n");
+        }
+      }
     } catch (error) { throw new DispatchNotSentError(error instanceof Error ? error.message || error.name : "Member preflight failed before session.create"); }
     const identity = { kind: "private", memberId: launch.memberId, runId: launch.runId, ...(launch.parentMemberId ? { parentMemberId: launch.parentMemberId } : {}), ...(launch.taskId ? { taskId: launch.taskId } : {}), ...(launch.dispatchId ? { dispatchId: launch.dispatchId } : {}) };
     const session = await this.ctx.session.create({
@@ -101,17 +120,13 @@ export class OpenCodeAdapter {
       // Never enable that unmetered execution path.
       location: { directory: launch.scope.projectDirectory },
       metadata: { teamflow: identity },
-      // Native 2.3.2 filters the Code Mode catalog using each tool's effective
-      // permission action before running model hooks. Leave execute enabled,
-      // allow only the read tools and our effective IDs, and deny e.g. webfetch.
-      permissions: launch.discussionOnly ? [
-        { action: "*", resource: "*", effect: "deny" },
-        ...discussionPermissions.map(action => ({ action, resource: "*", effect: "allow" as const })),
-      ] : [
-        { action: "subagent", resource: "*", effect: "deny" },
-        ...(launch.writes === false ? [{ action: "edit", resource: "*", effect: "deny" as const }] : []),
-        ...(launch.parentMemberId || launch.allowDefaultAgentFallback && launch.writes === false ? [{ action: "shell", resource: "*", effect: "deny" as const }] : []),
-      ],
+      // Deny-only: session rules must never grant an action denied/asked by
+      // the agent or host. The request/execution hooks cover late tool changes.
+      permissions: [...new Set([
+        "subagent", ...disabledActions,
+        ...(launch.writes === false ? ["edit"] : []),
+        ...(launch.parentMemberId || launch.allowDefaultAgentFallback && launch.writes === false ? ["shell"] : []),
+      ])].map(action => ({ action, resource: "*", effect: "deny" as const })),
     });
     // Only the positively identified result of this exact new creation may be
     // archived here. No list scans, no retroactive changes to old sessions.
@@ -121,11 +136,45 @@ export class OpenCodeAdapter {
     // 2.3.2's plugin SessionDomain.update accepts the field in its type, but
     // does not archive at runtime. The native HTTP PATCH does; verify by GET.
     await client.session.update({ sessionID: session.id, archived: true });
-    if (!(await client.session.get({ sessionID: session.id })).time.archived) throw new Error("New private Teamflow session is not archived; no dispatch or design prompt admitted");
+    const native = await client.session.get({ sessionID: session.id });
+    if (!native.time.archived) throw new Error("New private Teamflow session is not archived; no dispatch or design prompt admitted");
+    if (launch.requireExactModel && (!native.model || !sameModel(native.model, model))) {
+      throw new Error(`New native session did not persist selected model ${model.providerID}/${model.id}; no work was admitted`);
+    }
     // The brief is an instruction entry, not a fabricated conversation or an implicit agent start.
     // Preserve even a partially configured real session for explicit reconciliation.
     await this.ctx.session.instructions.entry.put({ sessionID: session.id, key: "teamflow.task", value: launch.brief });
-    return { sessionId: session.id, execution: { time: session.time, outcome: session.outcome } };
+    if (skillInstruction) await this.ctx.session.instructions.entry.put({ sessionID: session.id, key: "teamflow.stage-skills", value: skillInstruction });
+    return { sessionId: session.id, execution: { time: session.time, outcome: session.outcome },
+      ...(native.model ? { model: { providerID: native.model.providerID, id: native.model.id } } : {}) };
+  }
+
+  async nativeForms(task: Task) {
+    const client = await this.formClient(task);
+    return client.session.form.list({ sessionID: task.sessionId! });
+  }
+
+  async nativeFormReply(task: Task, formId: string, answer: SessionFormReplyInput["answer"], assertCurrent: () => void) {
+    const client = await this.formClient(task);
+    const input = { sessionID: task.sessionId!, formID: formId };
+    const form = await client.session.form.get(input);
+    if (form.sessionID !== input.sessionID || form.id !== formId || form.state.status !== "pending" || form.fields.some(field => field.type === "external")) {
+      throw new Error("Form is not a pending member question in this native session");
+    }
+    assertCurrent();
+    await client.session.form.reply({ ...input, answer });
+  }
+
+  private async formClient(task: Task) {
+    const client = await this.nativeClient();
+    if (!task.sessionId || !task.dispatch || task.sessionId !== task.dispatch.sessionId) throw new Error("No bound native member session");
+    const native = await client.session.get({ sessionID: task.sessionId });
+    const tag = native.metadata?.teamflow as Record<string, unknown> | undefined;
+    if (native.id !== task.sessionId || native.location.directory !== this.ctx.location.directory || native.parentID ||
+      tag?.kind !== "private" || tag.runId !== task.runId || tag.memberId !== task.memberId || tag.taskId !== task.id || tag.dispatchId !== task.dispatchId) {
+      throw new Error("Native form session identity no longer matches the Teamflow task");
+    }
+    return client;
   }
 
   async deliver(delivery: MemberDelivery) {
@@ -249,10 +298,11 @@ export class OpenCodeAdapter {
       evidence: [`native identity matched ${sessionId} member=${task.memberId} run=${task.runId}`, `native time before=${JSON.stringify(session.time)} after=${JSON.stringify(after.time)} executionChanged=${executionChanged} outcome=${after.outcome ?? "none"}`, `dispatch=${task.dispatchId} ${queued ? "queued" : delivered ? "delivered" : "absent"}; inbox=${inbox.map(m => m.id).join(",")}`, `native running shell IDs=${shells.map(s => s.id).join(",")}; active tool messages=${activeTools.length}`],
     };
   }
-  async prepareBound(sessionId: string, brief: string) {
+  async prepareBound(sessionId: string, brief: string, expectedModel?: MemberLaunch["model"]) {
     const session = await (await this.nativeClient()).session.get({ sessionID: sessionId });
     const tag = session.metadata?.teamflow as Record<string, unknown> | undefined;
     if (tag?.kind === "private" && !session.time.archived) throw new Error("Private Teamflow session was not archived; no recovery dispatch admitted");
+    if (expectedModel && (!session.model || !sameModel(session.model, expectedModel))) throw new Error("Native session does not have the durably selected model; no recovery dispatch admitted");
     await this.ctx.session.instructions.entry.put({ sessionID: sessionId, key: "teamflow.task", value: brief });
   }
   async stopDispatch(scope: BackendScope, task: Task, candidate?: string) {

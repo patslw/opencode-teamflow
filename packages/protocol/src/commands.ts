@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { BackendScopeSchema, DraftSchema, EvidenceSchema, PatchSchema, SnapshotSchema, TemplateSchema, VersionSchema } from "./model.js";
+import { BackendScopeSchema, DraftSchema, EvidenceSchema, ModelCandidateSchema, ModelChoiceSchema, ModelTargetSchema, PatchSchema, QuestionOptionsSchema, SnapshotSchema, TemplateSchema, VersionSchema } from "./model.js";
 const id = z.string().min(1);
 const dialogueText = z.string().trim().min(1).max(32000);
 const command = <T extends string, S extends z.ZodRawShape>(type: T, shape: S) => z.object({ type: z.literal(type), payload: z.object(shape).strict() }).strict();
@@ -11,26 +11,29 @@ export const AgentCommands = {
   reviewSubmit: command("review.submit", { ...binding, targetAttemptId: id, verdict: z.enum(["pass", "needs_revision", "reject"]), issues: z.array(id), evidence: z.array(EvidenceSchema) }),
   memberSpawn: command("member.spawn", { memberId: id, runId: id, role: id, brief: id.max(32000), parentMemberId: id.optional(), ...association }),
   memberFinish: command("member.finish", { taskId: id, summary: id.max(32000), ...association }),
-  messageSend: command("message.send", { runId: id, toMemberId: id, text: id, ...association }),
+  messageSend: command("message.send", { runId: id, toMemberId: id, text: id, purpose: z.literal("proposal_discussion").optional(), ...association }),
   messageAck: command("message.ack", { messageId: id }),
-  questionAsk: command("question.ask", { question: dialogueText }),
+  questionAsk: command("question.ask", { question: dialogueText, options: QuestionOptionsSchema.optional() }),
   topicOpen: command("topic.open", { runId: id, topicId: id, question: id, participantIds: z.array(id), unrelatedReason: id.optional(), sourceTopicId: id.optional() }),
   topicRespond: command("topic.respond", { topicId: id, text: id, evidence: z.array(id).optional() }),
   topicResolve: command("topic.resolve", { topicId: id, conclusion: id, actionItems: z.array(id).optional() }),
   correctionPropose: command("correction.propose", { runId: id, correctionId: id, reason: id, affectedAttemptIds: z.array(id).min(1), requirements: id.max(32000).optional(), criteriaRevision: id.optional() }),
   draftSave: command("draft.save", { draft: DraftSchema }),
   patchPropose: command("patch.propose", { patch: PatchSchema }),
+  modelPlan: command("model.plan", { runId: id, target: ModelTargetSchema, versionId: id, choice: ModelChoiceSchema }),
 };
 export const AgentCommandSchema = z.discriminatedUnion("type", [
   AgentCommands.taskSubmit, AgentCommands.reviewSubmit, AgentCommands.memberSpawn, AgentCommands.memberFinish,
   AgentCommands.messageSend, AgentCommands.messageAck, AgentCommands.questionAsk, AgentCommands.topicOpen,
   AgentCommands.topicRespond, AgentCommands.topicResolve, AgentCommands.correctionPropose,
-  AgentCommands.draftSave, AgentCommands.patchPropose,
+  AgentCommands.draftSave, AgentCommands.patchPropose, AgentCommands.modelPlan,
 ]);
 export const CommandSchema = z.discriminatedUnion("type", [
   command("run.start", { runId: id, versionId: id, label: id, brief: id.max(32000).optional(), mainSessionId: id.optional(), config: z.object({ activeSlots: z.number().int().min(1).max(16).optional(), childDepth: z.number().int().min(0).max(2).optional(), reworkAttempts: z.number().int().min(0).max(10).optional() }).strict().optional() }),
   command("run.pause", { runId: id }), command("run.resume", { runId: id }), command("run.cancel", { runId: id }),
   ...AgentCommandSchema.options,
+  command("model.candidates", { runId: id, candidates: z.array(ModelCandidateSchema).max(40) }),
+  command("model.clear", { runId: id, target: ModelTargetSchema, versionId: id }),
   command("question.answer", { questionId: id, answer: dialogueText }),
   command("gate.approve", binding), command("gate.reject", { ...binding, reason: id }),
   command("dispatch.reconcile", { taskId: id, action: z.enum(["inspect", "bind", "terminate"]), reason: id, sessionId: id.optional() }),

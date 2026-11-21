@@ -11,7 +11,9 @@ import { notifyCommitted } from "./notify-committed.js";
 import type { BackendScope, MutationResult } from "../../packages/protocol/src/index.js";
 import type { RpcRegistration } from "@opencode/plugin/promise/rpc";
 import { uid } from "./engine.js";
-import { conversationEligible } from "./execution-fence.js";
+import { conversationEligible, recoveryBlocks } from "./execution-fence.js";
+import { blockingQuestion } from "./questions.js";
+import { listCapabilities, taskCapabilities } from "./stage-capabilities.js";
 
 export default Plugin.define({
   id: "teamflow",
@@ -29,9 +31,40 @@ export default Plugin.define({
     const assertScope = (requested: BackendScope) => {
       if (requested.backendId !== scope.backendId || requested.projectDirectory !== scope.projectDirectory) throw new Error("Scope mismatch");
     };
+    const formTasks = (runId: string) => {
+      const s = store.read(scope);
+      if (!s.runs.some(r => r.id === runId && ["running", "waiting"].includes(r.status))) return [];
+      return s.tasks.filter(t => t.runId === runId && t.sessionId && t.dispatch?.delivery === "admitted" &&
+        t.slotHeld && t.status === "running" && t.executionMode !== "conversation" && conversationEligible(s, t) &&
+        !recoveryBlocks(t) && !blockingQuestion(s, t) && taskCapabilities(s, t)?.allowsTool("question") &&
+        s.members.some(m => !m.legacy && m.id === t.memberId && m.taskId === t.id && m.sessionId === t.sessionId));
+    };
     const registration: RpcRegistration<typeof TeamflowDemo> = await ctx.rpc.register(TeamflowDemo, {
       info: async () => ({ backendId: scope.backendId, directory: ctx.location.directory, version: ctx.app.version, runtime: Object.fromEntries(Object.entries(process.versions).filter((entry): entry is [string, string] => typeof entry[1] === "string")), sqlite: store.sqliteVersion }),
       snapshot: requested => { assertScope(requested); return service.snapshot(requested); },
+      capabilities: requested => { assertScope(requested); return listCapabilities(ctx); },
+      models: requested => { assertScope(requested); return adapter.listModels(); },
+      nativeForms: async input => {
+        assertScope(input.scope);
+        const tasks = formTasks(input.runId);
+        const pending = await Promise.all(tasks.map(async task => ({ task, forms: await adapter.nativeForms(task) })));
+        const current = formTasks(input.runId);
+        return pending.flatMap(({ task, forms }) => current.some(t => t.id === task.id && t.sessionId === task.sessionId)
+          ? forms.filter(f => f.sessionID === task.sessionId && !f.fields.some(field => field.type === "external"))
+            .map(f => ({ runId: task.runId, taskId: task.id, attemptId: task.attemptId, sessionId: task.sessionId!, formId: f.id, title: f.title, fields: f.fields }))
+          : []);
+      },
+      nativeFormReply: async input => {
+        assertScope(input.scope);
+        const assertCurrent = () => {
+          const task = formTasks(input.runId).find(t => t.id === input.taskId && t.attemptId === input.attemptId && t.sessionId === input.sessionId);
+          if (!task) throw new Error("Form is not bound to a current, executing Teamflow stage");
+          return task;
+        };
+        // Trusted RPC only; never re-admit a prompt or synthesize an answer.
+        await adapter.nativeFormReply(assertCurrent(), input.formId, input.answer, assertCurrent);
+        return { accepted: true };
+      },
       // RPC has no actor identity: authenticated local trusted-client boundary, never input.actor.
       mutate: async (envelope, context) => {
         let result: MutationResult;

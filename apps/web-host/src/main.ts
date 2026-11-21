@@ -4,6 +4,7 @@ import { listenConfig } from "./listen.js";
 import { readFile } from "node:fs/promises";
 import { resolve, extname, sep } from "node:path";
 import { backendRegistry } from "./backends.js";
+import { streamSession } from "./session-stream.js";
 
 // Local administrator configuration, never supplied by a browser or discovered plugin.
 const listen = await listenConfig();
@@ -44,6 +45,9 @@ const handle: RequestListener = async (request, response) => {
       response.setHeader("Content-Type", "application/json");
       response.end(JSON.stringify(registry.catalog)); return;
     }
+    if (request.method === "GET" && url.pathname === "/api/session/live") {
+      await streamSession(url, response, registry.select); return;
+    }
     const { scope, rpc, options, info, client, readMessages } = await registry.select(url);
     if (response.destroyed) return;
     if (request.method === "GET" && url.pathname === "/api/events") {
@@ -69,6 +73,14 @@ const handle: RequestListener = async (request, response) => {
     }
     let output: unknown;
     if (request.method === "GET" && url.pathname === "/api/info") output = { ...info, scope };
+    else if (request.method === "GET" && url.pathname === "/api/capabilities") output = await rpc.capabilities(scope, options);
+    else if (request.method === "GET" && url.pathname === "/api/models") output = await rpc.models(scope, options);
+    else if (request.method === "GET" && url.pathname === "/api/native-forms") output = await rpc.nativeForms({scope,runId:url.searchParams.get("runId")??""}, options);
+    else if (request.method === "POST" && url.pathname === "/api/native-form-reply") {
+      const input=await body(request);
+      if (input.scope?.backendId!==scope.backendId || input.scope?.projectDirectory!==scope.projectDirectory) throw new Error("表单不属于当前项目");
+      output=await rpc.nativeFormReply({...input,scope},options);
+    }
     else if (request.method === "GET" && url.pathname === "/api/snapshot") output = await rpc.snapshot(scope, options);
     else if (request.method === "POST" && url.pathname === "/api/mutate") {
       const input = await body(request);

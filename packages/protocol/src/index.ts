@@ -1,7 +1,7 @@
 export * from "./model.js";
 export * from "./commands.js";
 export * from "./workflow-diff.js";
-import type { ActorContext, BackendScope, TeamflowSnapshot } from "./model.js";
+import type { ActorContext, BackendScope, ModelRef, TeamflowSnapshot } from "./model.js";
 import type { MutationEnvelope, MutationResult } from "./commands.js";
 export interface TeamflowService {
   snapshot(scope: BackendScope): Promise<TeamflowSnapshot>;
@@ -9,11 +9,11 @@ export interface TeamflowService {
 }
 export interface MemberLaunch {
   scope: BackendScope; runId: string; memberId: string; parentMemberId?: string; role: string; brief: string;
-  model?: { providerID: string; id: string };
+  model?: ModelRef;
+  requireExactModel?: boolean;
   writes?: boolean;
-  discussionOnly?: boolean;
   allowDefaultAgentFallback?: boolean;
   sessionId?: string; taskId?: string; dispatchId?: string;
 }
 export interface MemberDelivery { messageId: string; sessionId: string; text: string; source: string; intent: "queue" | "steer"; resume?: boolean }
-export interface MemberSession { sessionId: string; execution: unknown }
+export interface MemberSession { sessionId: string; execution: unknown; model?: ModelRef }

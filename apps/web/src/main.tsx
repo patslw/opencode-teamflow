@@ -1,14 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import {
-  ReactFlow,
-  Background,
-  Controls,
-  MiniMap,
-  MarkerType,
-} from "@xyflow/react";
-import type { Connection } from "@xyflow/react";
-import "@xyflow/react/dist/style.css";
+import { StageGraph } from "./StageGraph";
+import { LiveSession } from "./LiveSession";
+import {StageSettings} from "./StageSettings";
+import {useNavigation, type View} from "./navigation";
 import "./style.css";
 import { CollaborationPanel } from "./CollaborationPanel";
 import { DraftView } from "./DraftView";
@@ -131,12 +126,14 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
   const [notice, setNotice] = useState("");
   const [pending, setPending] = useState(false);
   const [unresolved, setUnresolved] = useState<MutationEnvelope>();
-  const [versionId, setVersionId] = useEditorState("", editorEpoch);
-  const [runId, setRunId] = useEditorState("", editorEpoch);
-  const [studio,setStudio] = useState(false);
-  const [studioTab,setStudioTab]=useState<"discuss"|"graph"|"start">("discuss");
-  const [nodeId, setNodeId] = useEditorState("", editorEpoch);
-  const [memberId, setMemberId] = useEditorState("", editorEpoch);
+  const {view,go}=useNavigation();
+  const versionId=view.versionId??"",runId=view.runId??"",nodeId=view.nodeId??"",memberId=view.memberId??"";
+  const studio=view.page==="studio", studioTab=view.pane??"discuss";
+  const navigate=(v:View)=>{editorEpoch.current++;go(v)};
+  const setNodeId=(nodeId:string)=>navigate({...view,nodeId});
+  const setMemberId=(memberId:string)=>navigate({...view,memberId});
+  const setStudioTab=(pane:View["pane"])=>navigate({...view,pane});
+  useEffect(()=>{editorEpoch.current++},[view]);
   const [draft, setDraft] = useEditorState<WorkflowVersion | undefined>(
     undefined,
     editorEpoch,
@@ -208,7 +205,7 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
   const published =
     snapshot?.versions.find((v) => v.id === (run?.versionId ?? versionId)) ??
     (!versionId && !runId ? snapshot?.versions[0] : undefined);
-  const version = draft ?? published;
+  const version = !run && draft?.templateId===published?.templateId && (draft?.id===published?.id||draft?.parentVersionId===published?.id) ? draft??published : published;
   const edgeIdentity = JSON.stringify([
     runId,
     version?.id,
@@ -277,20 +274,9 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
   function selectVersion(id: string) {
     if (!leaveDraft()) return;
     setDraft(undefined);
-    setRunId("");
-    setVersionId(id);
-    setNodeId("");
-    setMemberId("");
-    setSelectedEdge(undefined);
+    navigate({page:"studio",versionId:id,pane:studioTab});setSelectedEdge(undefined);
   }
-  function selectRun(id: string) {
-    if (!leaveDraft()) return;
-    setDraft(undefined);
-    setRunId(id);
-    setNodeId("");
-    setMemberId("");
-    setSelectedEdge(undefined);
-  }
+  function selectRun(id:string) { navigate(id?{page:"run",runId:id,tab:"chat"}:{page:"new"});setSelectedEdge(undefined); }
   function updateVersion(fn: (v: WorkflowVersion) => WorkflowVersion) {
     if (version && !run) setDraft(fn(structuredClone(version)));
   }
@@ -311,72 +297,7 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
       roles: v.roles.map((r) => (r.id === id ? { ...r, ...patch } : r)),
     }));
   }
-  const graphNodes =
-    version?.graph.nodes.map((n, i) => {
-      const a =
-        snapshot && run ? currentAttempt(snapshot, run.id, n.id) : undefined;
-      // Topological levels keep parallel AND branches visible without a layout service.
-      const level = (id: string, seen = new Set<string>()): number => {
-        if (seen.has(id)) return 0;
-        const next = new Set(seen).add(id);
-        const parents = version.graph.edges.filter(
-          (e) => e.to === id && e.kind === "normal",
-        );
-        return parents.length
-          ? 1 + Math.max(...parents.map((e) => level(e.from, next)))
-          : 0;
-      };
-      const l = level(n.id);
-      const peers = version.graph.nodes
-        .slice(0, i)
-        .filter((p) => level(p.id) === l).length;
-      return {
-        id: n.id,
-        position: { x: l * 240, y: peers * 135 },
-        selected: n.id === nodeId,
-        className: `stage ${a?.status ?? n.kind}`,
-        data: {
-          label: (
-            <>
-              <strong>{n.name}</strong>
-              <small>
-                {n.kind} · {n.mode}
-              </small>
-              <small>
-                {a ? `${label(a.status)} · 第 ${a.round} 轮` : n.id}
-              </small>
-            </>
-          ),
-        },
-      };
-    }) ?? [];
-  const graphEdges =
-    version?.graph.edges.map((e, i) => ({
-      id: String(i),
-      source: e.from,
-      target: e.to,
-      label: e.kind === "return" ? "返工" : "",
-      animated: false,
-      style: {
-        stroke: e.kind === "return" ? "#d49748" : "#667e90",
-        strokeDasharray: e.kind === "return" ? "5 5" : undefined,
-      },
-      markerEnd: { type: MarkerType.ArrowClosed },
-      selected: selectedEdge === i,
-    })) ?? [];
-  const onConnect = (c: Connection) => {
-    if (c.source && c.target && !run)
-      updateVersion((v) => ({
-        ...v,
-        graph: {
-          ...v.graph,
-          edges: [
-            ...v.graph.edges,
-            { from: c.source!, to: c.target!, kind: edgeKind },
-          ],
-        },
-      }));
-  };
+  const onConnect = (source:string,target:string) => {if(!run)updateVersion(v=>({...v,graph:{...v.graph,edges:[...v.graph.edges,{from:source,to:target,kind:edgeKind}]}}));};
   if (!studio) return <>
     {(error || unresolved || connectionState.includes("失败") || connectionState.includes("断开")) && <div className="desk-notifications" role="alert">
       {error && <details open><summary>这次操作没有确认成功</summary><p>{error}</p><button onClick={()=>setError("")}>收起提示</button></details>}
@@ -384,11 +305,11 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
       {connectionState!=="已连接"&&<button onClick={()=>setReconnect(x=>x+1)}>重新连接项目</button>}
     </div>}
     {snapshot ? <TeamDesk s={snapshot} run={run} busy={pending||!!unresolved} active={active} connection={connection.current}
-      choose={selectRun} mutate={mutate} design={id=>{selectVersion(id??published?.id??"");setStudioTab("discuss");setStudio(true)}} inspect={id=>{selectRun(id);setStudioTab("graph");setStudio(true)}}/>:<div className="studio-bar">正在打开工作台…</div>}
+      choose={selectRun} mutate={mutate} design={id=>navigate({page:"studio",versionId:id??published?.id,pane:"discuss"})} inspect={id=>navigate({page:"studio",runId:id,pane:"graph"})}/>:<div className="studio-bar">正在打开工作台…</div>}
     </>;
   return (
     <div className="app design-studio" data-pane={studioTab}>
-      <div className="studio-bar"><button onClick={()=>{if(leaveDraft())setStudio(false)}}>← 返回团队对话</button><b>{run?"流程和工作记录":"设计工作流程"}</b></div>
+      <div className="studio-bar"><button onClick={()=>navigate(runId?{page:"run",runId,tab:"chat"}:{page:"overview"})}>{runId?"团队对话":"项目总览"}</button><b>{run?"流程和工作记录":"设计工作流程"}</b></div>
 
       <div className="messages" aria-live="polite">
         {error && (
@@ -503,14 +424,14 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
                 )}
               </div>
               <div className="studio-tabs" role="group" aria-label="流程工具"><button aria-pressed={studioTab==="discuss"} onClick={()=>setStudioTab("discuss")}>{run?"变更这次流程":"与设计者讨论"}</button><button aria-pressed={studioTab==="graph"} onClick={()=>setStudioTab("graph")}>查看流程图</button>{!run&&<button aria-pressed={studioTab==="start"} onClick={()=>setStudioTab("start")}>使用或导入流程</button>}</div><div hidden={studioTab!=="discuss"}>
-              {snapshot && !run && <DraftView active={active} snapshot={snapshot} version={published} localVersion={draft}
+              {snapshot && !run && <DraftView active={active&&studioTab==="discuss"} snapshot={snapshot} version={published} localVersion={draft}
                 pending={pending || !!unresolved} mutate={mutate} connection={connection.current}
                 touched={() => { editorEpoch.current++; setDraftPanelInput(true); }}
                 input={draftPanelText} setInput={setDraftPanelText} editorEpoch={editorEpoch}
                 preview={(v) => {
                   if (draft && pretty({ graph: draft.graph, roles: draft.roles }) !== pretty({ graph: v.graph, roles: v.roles }) &&
                     !confirm("图编辑器已有未保存的本地图/提示词输入。预览此面板草稿将替换它们（不会自动保存）。取消可完整保留当前图；请先采用到面板或复制备份。明确替换？")) return;
-                  setDraft(v); setNodeId(""); setMemberId(""); setStudioTab("graph");
+                  setDraft(v);navigate({...view,pane:"graph",nodeId:"",memberId:""});
                 }}
               />}
               {snapshot && run && <PatchView key={run.id} snapshot={snapshot} runId={run.id} pending={pending || !!unresolved} mutate={mutate} />}
@@ -629,26 +550,8 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
                       </small>
                     </div>
                   )}
-                  <div className="graph" aria-label="工作流图">
-                    <ReactFlow
-                      key={`${runId}:${version.id}`}
-                      nodes={graphNodes}
-                      edges={graphEdges}
-                      onNodeClick={(_, n) => setNodeId(n.id)}
-                      onEdgeClick={(_, e) => setSelectedEdge(Number(e.id))}
-                      onConnect={onConnect}
-                      nodesDraggable={false}
-                      nodesConnectable={!run}
-                      fitView
-                      fitViewOptions={{ padding: 0.15 }}
-                      minZoom={0.25}
-                      maxZoom={1.5}
-                    >
-                      <Background gap={24} />
-                      <Controls />
-                      <MiniMap />
-                    </ReactFlow>
-                  </div>
+                  {studioTab==="graph"&&<StageGraph version={version} run={run} snapshot={snapshot} selectedId={nodeId} onSelect={setNodeId}
+                    onConnect={run?undefined:onConnect} onEdgeSelect={setSelectedEdge} selectedEdge={selectedEdge}/>}
                   {!run && (
                     <div className="toolbar">
                       <small>
@@ -721,6 +624,7 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
                         <NodeEditor
                           key={`${runId}:${version.id}:${node.id}`}
                           node={node}
+                          scope={selectedScope}
                           version={version}
                           readOnly={!!run}
                           update={updateNode}
@@ -821,7 +725,7 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
                                  !draftPanelInput &&
                                  epoch === editorEpoch.current
                               ) {
-                                setRunId(id); setStudio(false);
+                                selectRun(id);
                                 setDraft(undefined);
                                 setSelectedEdge(undefined);
                                 setRunLabel("");
@@ -861,9 +765,7 @@ function App({ selectedScope, active }: { selectedScope: BackendScope; active: b
                                         `版本 ${v.id} 已导入；当前本地草稿/输入与选择保留，不自动切换。`,
                                       );
                                     } else {
-                                      setRunId("");
-                                      setVersionId(v.id);
-                                      setNodeId("");
+                                      navigate({page:"studio",pane:"graph",versionId:v.id});
                                       setSelectedEdge(undefined);
                                       setImportText("");
                                     }
@@ -930,14 +832,14 @@ function RunEntry({ run, snapshot, connection, openMember }: {
 }
 
 function NodeEditor({
-  node,
+  scope, node,
   version,
   readOnly,
   update,
   updateRole,
   updateVersion,
 }: {
-  node: WorkflowNode;
+  scope: BackendScope; node: WorkflowNode;
   version: WorkflowVersion;
   readOnly: boolean;
   update: (p: Partial<WorkflowNode>) => void;
@@ -1004,6 +906,7 @@ function NodeEditor({
           </select>
         </label>
       </div>
+      {node.role&&<StageSettings scope={scope} node={node} update={update} readOnly={readOnly}/>}
       {field("节点提示词", node.prompt, (prompt) => update({ prompt }), true)}
       <label className="field">
         角色
@@ -1501,57 +1404,24 @@ function SessionView({
   back: () => void;
   open: (id: string) => void;
 }) {
-  const [messages, setMessages] = useState<unknown[]>([]),
-    [text, setText] = useState(""),
-    [error, setError] = useState(""),
+  const [text, setText] = useState(""),
     [sendError, setSendError] = useState(""),
     [notice, setNotice] = useState(""),
-    [pending, setPending] = useState(false),
-    [loading, setLoading] = useState(true);
+    [pending, setPending] = useState(false);
   const [topicId, setTopicId] = useState(""), [unrelatedReason, setUnrelatedReason] = useState("");
-  const sequence = useRef(0);
   const sendGeneration = useRef(0);
   const alive = useRef(true);
   const task = snapshot.tasks.find((t) => t.sessionId === member.sessionId);
   const canSend =
     !member.legacy && !!task && ["running", "submitted"].includes(task.status) && !task.child?.staleBy &&
     !["cancelled", "failed"].includes(snapshot.runs.find(r => r.id === member.runId)?.status ?? "failed");
-  async function load() {
-    const seq = ++sequence.current;
-    try {
-      if (!connection) throw new Error("连接尚未就绪");
-      const result = await connection.sessionMessages(member.sessionId);
-      if (alive.current && seq === sequence.current) {
-        setMessages(result);
-        setError("");
-        setLoading(false);
-      }
-    } catch (e) {
-      if (alive.current && seq === sequence.current) {
-        setError(
-          `读取原生会话失败：${String(e)}。成员和 session ID 保留，可刷新重试；不自动创建替代会话。`,
-        );
-        setLoading(false);
-      }
-    }
-  }
   useEffect(() => {
     sendGeneration.current++;
     setPending(false);
-    if (!active) {
-      setMessages([]);
-      setLoading(true);
-      setError("");
-      return;
-    }
-    alive.current = true;
-    void load();
-    const timer = setInterval(() => void load(), 5000);
+    alive.current = active;
     return () => {
       alive.current = false;
       sendGeneration.current++;
-      sequence.current++;
-      clearInterval(timer);
     };
   }, [connection, member.sessionId, active]);
   async function send() {
@@ -1567,7 +1437,6 @@ function SessionView({
       if (!result) return;
       if (currentSend()) {
         setNotice("消息意图已持久化；原生接收与成员处理确认分开追踪。输入保留，不自动重发。");
-        await load();
       }
     } catch (e) {
       if (currentSend()) setSendError(`${String(e)}；消息输入已保留。`);
@@ -1577,7 +1446,7 @@ function SessionView({
   }
   return (
     <>
-      <button onClick={back}>← 返回流程</button>
+      <button onClick={back}>查看流程</button>
       <div className="page-title">
         <div>
           <span className="eyebrow">成员 / 原生 OpenCode 会话</span>
@@ -1587,34 +1456,19 @@ function SessionView({
             {member.id} · run {member.runId}
           </p>
         </div>
-        <button onClick={() => void load()}>刷新消息与工具状态</button>
       </div>
       <p className="muted">
         原始 session ID
         保持不变。消息来自原生上下文；没有完整响应前不推断成员空闲或完成。
       </p>
-      {error && (
-        <div className="error" role="alert">
-          {error}
-        </div>
-      )}
       {sendError && (
         <div className="error" role="alert">
           {sendError}
         </div>
       )}
       {notice && <div className="notice">{notice}</div>}
-      <div className="panel session-messages">
-        {loading
-          ? "读取原生会话…"
-          : messages.length === 0
-            ? error
-              ? "读取失败，尚未取得原生消息。"
-              : "原生上下文暂无消息"
-            : messages.map((message, i) => (
-                <NativeMessage key={i} value={message} />
-              ))}
-      </div>
+      <LiveSession scope={snapshot.scope} sessionId={member.sessionId} active={active} who={member.role}
+        sent={snapshot.messages.filter(m=>m.runId===member.runId&&m.to===member.id&&m.senderKind==="user")}/>
       <section className="panel">
         <h2>向此成员发送指示</h2>
         <p>

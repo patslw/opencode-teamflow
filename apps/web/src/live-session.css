@@ -1,0 +1,23 @@
+.live-session { min-width: 0; margin: 12px 0 16px; }
+.live-session-head, .live-session-skills { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.live-session-caption { font-size: 13px; font-weight: 650; }
+.live-session-state { background: #72849124; border-radius: 999px; padding: 3px 9px; font-size: 12px; }
+.live-session-state.thinking, .live-session-state.working { background: #29866926; }
+.live-session-state.waiting { background: #ba862037; }
+.live-session-state.failed { background: #c4494936; }
+.live-session-note { margin: 8px 0; font-size: 12px; opacity: .82; }
+.live-session-skills { font-size: 12px; margin: 9px 0; overflow-wrap: anywhere; }
+.live-session-skills span:not(:first-child) { padding: 2px 7px; background: #678e7a24; border-radius: 5px; }
+.live-session-timeline { display: grid; gap: 7px; margin-top: 10px; max-height: min(55dvh, 33rem); overflow: auto; overscroll-behavior: contain; }
+.live-session-latest { font-size: 12px; }
+.live-session-post { padding: 9px 12px; min-width: 0; border-left: 2px solid #7c958766; overflow-wrap: anywhere; }
+.live-session-post.user { border-color: #718fa788; background: #718fa715; }
+.live-session-post > div:first-child { display: flex; gap: 8px; align-items: baseline; }
+.live-session time { font-size: 11px; opacity: .78; }
+.live-session-post p { white-space: pre-wrap; margin: 5px 0 0; line-height: 1.55; }
+.live-session-tool { padding: 6px 10px; border: 1px solid #84958a56; border-radius: 6px; font-size: 12px; }
+.live-session-tool summary { cursor: pointer; }
+.live-session-tool summary span { margin-left: 8px; border-radius: 5px; padding: 2px 5px; background: #72849123; }
+.live-session-tool summary span.failed { background: #c4494936; }
+.live-session-tool summary span.running { background: #29866926; }
+.live-session-tool > div { margin: 5px 0 1px 13px; opacity: .87; }

@@ -3,7 +3,7 @@ import { DraftSchema, type MutationResult, type TeamflowCommand, type TeamflowSn
 import type { TeamflowConnection } from "./connection";
 import { DefinitionChanges } from "./PatchRecovery";
 import "./flow-design.css";
-import { ChatText } from "./ChatText";
+import { LiveSession } from "./LiveSession";
 
 const pretty = (v: unknown) => JSON.stringify(v, null, 2);
 export function DraftView({ active, snapshot: s, version, localVersion, preview, mutate, pending, connection, touched, input, setInput, editorEpoch }: {
@@ -21,34 +21,15 @@ export function DraftView({ active, snapshot: s, version, localVersion, preview,
     window.addEventListener("beforeunload", warn); return () => window.removeEventListener("beforeunload", warn);
   }, [text]);
   const [error, setError] = useState(""), [notice, setNotice] = useState(""), [notes, setNotes] = useState("");
-  const [brief, setBrief] = useState(""), [messages, setMessages] = useState<{ sessionId: string; items: unknown[] }>(), [busy, setBusy] = useState(false);
+  const [brief, setBrief] = useState(""), [busy, setBusy] = useState(false);
   const epoch = editorEpoch;
-  useEffect(() => { if (!active) setMessages(undefined); }, [active]);
   const replace = (value: unknown) => {
     if (textRef.current && !confirm("替换当前草稿输入？请先保存或复制未保存的内容。")) return;
-    epoch.current++; edit(pretty(value)); setMessages(undefined);
+    epoch.current++; edit(pretty(value));
   };
   let parsed: ReturnType<typeof DraftSchema.parse> | undefined;
   try { if (text) parsed = DraftSchema.parse(JSON.parse(text)); } catch { /* 保留不完整的导入内容 */ }
   const saved = s.drafts.find(d => d.id === parsed?.id);
-  const sessionId = saved?.designer?.sessionId;
-  useEffect(() => {
-    if (!active || !connection || !sessionId) return;
-    let live = true, reading = false;
-    const load = async () => {
-      if (reading) return;
-      reading = true;
-      try {
-        const items = await connection.sessionMessages(sessionId);
-        if (live) setMessages({ sessionId, items });
-      } catch (e) {
-        if (live) setError(`无法读取设计者回复：${String(e)}`);
-      } finally { reading = false; }
-    };
-    void load();
-    const timer = window.setInterval(load, 4000);
-    return () => { live = false; window.clearInterval(timer); };
-  }, [active, connection, sessionId]);
   const content = (d: ReturnType<typeof DraftSchema.parse>) => ({ id: d.id, templateId: d.templateId, name: d.name, baseVersionId: d.baseVersionId, graph: d.graph, roles: d.roles, description: d.description });
   const same = !!parsed && !!saved && parsed.revision === saved.revision && pretty(content(parsed)) === pretty(content(saved));
   const perform = async (fn: () => Promise<void>) => { setError(""); setNotice(""); setBusy(true); try { await fn(); } catch (e) { setError(String(e)); } finally { setBusy(false); } };
@@ -94,10 +75,7 @@ export function DraftView({ active, snapshot: s, version, localVersion, preview,
     const designer = result.snapshot.drafts.find(d => d.id === current!.id)?.designer;
     if (designer?.deliveries.at(-1)?.state !== "admitted") { setNotice("消息送达状态未知；请先检查，不会自动重发。"); return; }
     if (briefRef.current.trim() === question) { briefRef.current = ""; setBrief(""); }
-    setNotice("已送交独立设计者。回复可能需要一点时间，请刷新讨论记录查看。");
-    if (connection && designer.sessionId) {
-      try { setMessages({ sessionId: designer.sessionId, items: await connection.sessionMessages(designer.sessionId) }); } catch { /* 发送已成功，读取可单独重试 */ }
-    }
+    setNotice("已送交独立设计者，回复会显示在下方。");
   });
   return <section aria-label="持久化草稿与独立设计" className="flow-design">
     <h2>和流程设计者讨论</h2>
@@ -107,25 +85,9 @@ export function DraftView({ active, snapshot: s, version, localVersion, preview,
       <p>{saved ? `当前草稿：${saved.name || "未命名草稿"}` : parsed ? "当前是尚未保存的草稿。" : "将以当前流程版本创建草稿，首次讨论时自动保存并连接独立设计者。"}</p>
       <label className="field">你想怎样改进流程？<textarea value={brief} placeholder="例如：遇到审核不通过时，希望先让负责人补充说明，再重新审核。" onChange={e => { briefRef.current = e.target.value; setBrief(e.target.value); }} /></label>
       <button disabled={pending || busy || !brief.trim() || (!parsed && (!version || !!text))} onClick={discuss}>{busy ? "正在处理…" : "发送给设计者讨论"}</button>
-      {saved?.designer && <button disabled={!connection || busy} onClick={() => void perform(async () => { const id = saved.designer!.sessionId; const items = await connection!.sessionMessages(id); setMessages({ sessionId: id, items }); })}>刷新讨论记录</button>}
       {saved?.designer && <p>{saved.designer.state === "ready" && saved.designer.deliveries.every(m => m.state === "admitted") ? "设计者已连接，回复会自动刷新。" : "设计者或消息状态未确认；不会自动重试。"} {saved.designer.error}</p>}
-      {saved?.designer && (() => {
-        const deliveries = saved.designer.deliveries;
-        const items = messages && messages.sessionId === sessionId ? messages.items : [];
-        const seen = new Set<string>();
-        const conversation = items.flatMap((value, i) => {
-          if (!value || typeof value !== "object") return [];
-          const m = value as { id?: string; type?: string; info?: { id?: string; role?: string }; role?: string; text?: string; parts?: { type?: string; text?: string; synthetic?: boolean; ignored?: boolean }[]; content?: { type?: string; text?: string; synthetic?: boolean; ignored?: boolean }[] };
-          const id = m.id ?? m.info?.id;
-          const delivery = deliveries.find(d => d.id === id);
-          if (delivery) { seen.add(delivery.id); return [{ key: delivery.id, who: "你", text: delivery.text }]; }
-          if ((m.info?.role ?? m.role ?? m.type) !== "assistant") return [];
-          const text = (m.parts ?? m.content ?? []).filter(p => p.type === "text" && !p.synthetic && !p.ignored && typeof p.text === "string").map(p => p.text).join("\n") || (typeof m.text === "string" ? m.text : "");
-          return text.trim() ? [{ key: id ?? `reply-${i}`, who: "设计者", text }] : [];
-        });
-        const missing = deliveries.filter(d => !seen.has(d.id)).map(d => ({ key: d.id, who: "你", text: d.text }));
-        return <div aria-label="讨论记录">{[...conversation, ...missing].map(item => <article className="flow-design-message" key={item.key}><strong>{item.who}</strong><ChatText text={item.text}/></article>)}</div>;
-      })()}
+       {saved?.designer && <LiveSession scope={s.scope} sessionId={saved.designer.sessionId} who="设计者" active={active}
+         sent={saved.designer.deliveries.filter(d=>d.state==="admitted").map(d=>({id:d.id,text:d.text,createdAt:d.at}))}/>}
       {notice && <p role="status">{notice}</p>}{error && <p role="alert" className="error">{error}（输入保留）</p>}
     </div>
     <div className="flow-design-card"><h3>2. 检查并保存草稿</h3>

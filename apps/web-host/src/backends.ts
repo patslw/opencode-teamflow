@@ -14,7 +14,7 @@ export async function backendRegistry(file: string) {
   const config = await loadBackendConfig(file);
   return {
     catalog: { defaultScope: config.defaultScope, backends: config.backends.map(b => ({ backendId: b.backendId, projects: b.projects })) },
-    async select(url: URL) {
+    async select(url: URL, signal?: AbortSignal) {
       const scope = { backendId: url.searchParams.get("backendId") ?? config.defaultScope.backendId,
         projectDirectory: url.searchParams.get("projectDirectory") ?? config.defaultScope.projectDirectory };
       const backend = config.backends.find(b => b.backendId === scope.backendId && b.projects.includes(scope.projectDirectory));
@@ -31,16 +31,21 @@ export async function backendRegistry(file: string) {
       // Access boots location plugins asynchronously. Cancellation never authorizes a mutation.
       let info;
       for (let attempt = 0; attempt < 30; attempt++) {
-        try { info = await rpc.info({}, options); break; }
-        catch (error) { if (attempt === 29) throw error; await new Promise(r => setTimeout(r, 500)); }
+        signal?.throwIfAborted();
+        try { info = await rpc.info({}, { ...options, signal }); break; }
+        catch (error) { if (attempt === 29 || signal?.aborted) throw error; await new Promise(r => setTimeout(r, 500)); }
       }
       if (!info) throw new Error("Plugin identity unavailable");
       assertPluginIdentity(scope, info);
-      const readMessages = async (sessionId: string) => {
+      const isSessionRegistered = async (sessionId: string, signal?: AbortSignal) => {
         // Check membership BEFORE native access, including old cached plugins.
-        const snapshot = await rpc.snapshot(scope, options);
-        if (!snapshot.members.some(m => m.sessionId === sessionId) && !snapshot.drafts.some(d => d.designer?.sessionId === sessionId) &&
-          !snapshot.runs.some(r => r.entry?.state === "ready" && r.entry.sessionId === sessionId))
+        const snapshot = await rpc.snapshot(scope, { ...options, signal });
+        if (snapshot.scope.backendId !== scope.backendId || snapshot.scope.projectDirectory !== scope.projectDirectory) return false;
+        return snapshot.members.some(m => m.sessionId === sessionId) || snapshot.drafts.some(d => d.designer?.sessionId === sessionId) ||
+          snapshot.runs.some(r => r.entry?.state === "ready" && r.entry.sessionId === sessionId);
+      };
+      const readMessages = async (sessionId: string) => {
+        if (!await isSessionRegistered(sessionId))
           throw new Error(`Session ${sessionId} is not registered in this scope`);
         try {
           await client.session.get({ sessionID: sessionId });
@@ -51,7 +56,7 @@ export async function backendRegistry(file: string) {
           throw new Error(`Original native session ${sessionId} unavailable: ${error instanceof Error ? error.message : "Native/RPC read failed; inspect original ID"}`);
         }
       };
-      return { scope, info, rpc, options, client, readMessages };
+      return { scope, info, rpc, options, client, readMessages, isSessionRegistered };
     },
   };
 }
